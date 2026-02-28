@@ -1,3 +1,7 @@
 aiogram==3.1.1
-aiohttp
-yt-dlp
+aiohttp==3.8.6
+yt-dlp==2026.2.21
+aiofiles==23.1.0
+pydantic==2.3.0
+typing-extenions==4.7.1
+magic-filter==1.0.12
