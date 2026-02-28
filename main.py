@@ -1,10 +1,10 @@
-# main.py — Ultra-PRO (переписанный для aiogram 3.25+)
+# main.py — Исправленная рабочая версия (видео в приоритете)
 import os
 import asyncio
 import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Dict, Tuple
 
 import aiosqlite
 import yt_dlp
@@ -20,32 +20,30 @@ from aiogram.types import (
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"
-PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")  # optional (stars provider)
-CURRENCY = os.environ.get("CURRENCY", "XTR")  # Stars default
-
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 6705555401))  # replace with your numeric ID
+PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")  # оставить пустым если нет
+CURRENCY = os.environ.get("CURRENCY", "XTR")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 6705555401))  # твой числовой ID
 
 DB_PATH = os.environ.get("DB_PATH", "users.db")
 WORKER_COUNT = int(os.environ.get("WORKER_COUNT", 3))
 
-# Premium settings (change if needed)
+# Premium settings
 GOLD_STARS = int(os.environ.get("GOLD_STARS", 120))
 GOLD_DAYS = int(os.environ.get("GOLD_DAYS", 30))
 DIAMOND_STARS = int(os.environ.get("DIAMOND_STARS", 250))
 DIAMOND_DAYS = int(os.environ.get("DIAMOND_DAYS", 90))
 
-# per-day limits
 LIMITS = {
     "none": 4,
     "gold": 10,
-    "diamond": None,  # unlimited
+    "diamond": None,
 }
 
-# ---------------- Bot init ----------------
-bot = Bot(token=BOT_TOKEN)   # note: parse_mode set per-send below
+# ---------------- bot init ----------------
+bot = Bot(token=BOT_TOKEN)  # parse_mode указываем при отправке
 dp = Dispatcher()
 
-# ---------------- queue (priority) ----------------
+# ---------------- queue ----------------
 priority_counter = itertools.count()
 
 @dataclass(order=True)
@@ -58,11 +56,9 @@ class JobItem:
     requested_at: datetime = field(compare=False)
 
 queue: "asyncio.PriorityQueue[Tuple[int,int,JobItem]]" = asyncio.PriorityQueue()
+awaiting_link: Dict[int, bool] = {}  # для /convert
 
-# /convert flow awaiting map
-awaiting_link: Dict[int, bool] = {}
-
-# ---------------- Database ----------------
+# ---------------- database ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -84,7 +80,6 @@ async def init_db():
                 total_purchases INTEGER DEFAULT 0
             );
         """)
-        # ensure stats row exists
         cur = await db.execute("SELECT COUNT(*) FROM stats")
         r = await cur.fetchone()
         if not r or r[0] == 0:
@@ -143,18 +138,15 @@ async def get_stats():
         async with db.execute("SELECT total_stars, gold_count, diamond_count, total_purchases FROM stats WHERE id=1") as cur:
             return await cur.fetchone()
 
-# ---------------- Helpers & yt-dlp ----------------
+# ---------------- helpers & yt-dlp ----------------
 def is_youtube_url(url: str) -> bool:
-    if not url:
-        return False
+    if not url: return False
     u = url.lower()
     return "youtube.com" in u or "youtu.be" in u
 
 def priority_for_level(level: str) -> int:
-    if level == "diamond":
-        return 0
-    if level == "gold":
-        return 1
+    if level == "diamond": return 0
+    if level == "gold": return 1
     return 2
 
 def choose_video_url(info: dict) -> Optional[str]:
@@ -180,7 +172,7 @@ def extract_photos_from_info(info: dict) -> List[str]:
     urls: List[str] = []
     if not info:
         return urls
-    if isinstance(info.get("entries"), list) and info.get("entries"):
+    if isinstance(info.get("entries"), list) and info["entries"]:
         for e in info["entries"]:
             if e.get("url") and e.get("ext") and e["ext"] in ("jpg","png","webp"):
                 urls.append(e["url"])
@@ -192,7 +184,6 @@ def extract_photos_from_info(info: dict) -> List[str]:
             urls.append(t["url"])
     if info.get("image"):
         urls.append(info.get("image"))
-    # dedupe
     seen = set()
     out: List[str] = []
     for u in urls:
@@ -215,7 +206,7 @@ async def ytdl_extract(url: str):
             return ydl.extract_info(url, download=False)
     return await loop.run_in_executor(None, run)
 
-# ---------------- Worker ----------------
+# ---------------- worker (video-first) ----------------
 async def worker_task(worker_id: int):
     session = aiohttp.ClientSession()
     try:
@@ -225,7 +216,6 @@ async def worker_task(worker_id: int):
             chat_id = job.chat_id
             url = job.url
             try:
-                # check/reset daily
                 await reset_daily_if_needed(user_id)
                 row = await get_user(user_id)
                 premium_level = row[2] if row else "none"
@@ -235,15 +225,12 @@ async def worker_task(worker_id: int):
                     queue.task_done()
                     continue
 
-                # try to extract info
                 try:
                     info = await ytdl_extract(url)
                 except Exception as e:
-                    # send friendly message with minimal stack
                     await bot.send_message(chat_id,
                         "<b>❌ Ошибка при обработке ссылки:</b>\n"
-                        f"<code>{str(e)}</code>\n"
-                        "Попробуй позже или пришли полную ссылку на пост (не короткую).",
+                        f"<code>{str(e)}</code>\nПопробуйте позже или пришлите полную ссылку на пост.",
                         parse_mode="HTML", disable_web_page_preview=True)
                     queue.task_done()
                     continue
@@ -253,11 +240,27 @@ async def worker_task(worker_id: int):
                     queue.task_done()
                     continue
 
-                # if playlist - pick first entry
                 if isinstance(info.get("entries"), list) and info.get("entries"):
                     info = info["entries"][0]
 
-                # photos
+                # --- VIDEO first ---
+                video_url = choose_video_url(info)
+                if video_url:
+                    try:
+                        await bot.send_chat_action(chat_id, "upload_video")
+                        await bot.send_video(chat_id, video_url, supports_streaming=True,
+                                             caption=(info.get("title") or ""), parse_mode="HTML")
+                        await increment_download(user_id)
+                        queue.task_done()
+                        continue
+                    except Exception:
+                        # fallback: send the direct link so user can open
+                        await bot.send_message(chat_id, f"✅ Вот прямая ссылка на видео:\n{video_url}", disable_web_page_preview=True)
+                        await increment_download(user_id)
+                        queue.task_done()
+                        continue
+
+                # --- if no video found, try photos ---
                 photos = extract_photos_from_info(info)
                 if photos:
                     medias = [InputMediaPhoto(media=p) for p in photos[:10]]
@@ -265,13 +268,12 @@ async def worker_task(worker_id: int):
                         for i in range(0, len(medias), 10):
                             await bot.send_media_group(chat_id, medias[i:i+10])
                     except Exception:
-                        # fallback to individual sends
                         for p in photos[:10]:
                             try:
                                 await bot.send_photo(chat_id, p)
                             except Exception:
                                 pass
-                    # audio if exists
+                    # attempt to send audio (if present)
                     music = None
                     music_meta = info.get("music") or info.get("audio") or info.get("track")
                     if isinstance(music_meta, dict):
@@ -286,28 +288,16 @@ async def worker_task(worker_id: int):
                     queue.task_done()
                     continue
 
-                # video
-                video_url = choose_video_url(info)
-                if video_url:
-                    try:
-                        await bot.send_chat_action(chat_id, "upload_video")
-                        await bot.send_video(chat_id, video_url, supports_streaming=True,
-                                             caption=(info.get("title") or ""), parse_mode="HTML")
-                        await increment_download(user_id)
-                    except Exception:
-                        # fallback: link
-                        await bot.send_message(chat_id, f"✅ Вот прямая ссылка на медиа:\n{video_url}", disable_web_page_preview=True)
-                        await increment_download(user_id)
-                else:
-                    await bot.send_message(chat_id, "<b>❌ Не найдено видео/фото в ссылке.</b>", parse_mode="HTML")
+                # nothing found
+                await bot.send_message(chat_id, "<b>❌ Не найдено видео или фото в этой ссылке.</b>", parse_mode="HTML")
             except Exception as e:
-                await bot.send_message(chat_id, f"<b>❌ Ошибка при обработке ссылки:</b> {e}", parse_mode="HTML")
+                await bot.send_message(chat_id, f"<b>❌ Внутренняя ошибка при обработке ссылки:</b> {e}", parse_mode="HTML")
             finally:
                 queue.task_done()
     finally:
         await session.close()
 
-# ---------------- Commands ----------------
+# ---------------- commands ----------------
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
@@ -315,19 +305,20 @@ async def cmd_start(msg: Message):
         "<b>🤖 Ultra-PRO Bot</b>\n\n"
         "Отправь ссылку на TikTok или Instagram — бот пришлёт готовое видео / фото+музыку.\n\n"
         "Введи <code>/menu</code> чтобы увидеть команды.",
-        parse_mode="HTML", disable_web_page_preview=True)
+        parse_mode="HTML", disable_web_page_preview=True
+    )
 
 @dp.message(Command("menu"))
 async def cmd_menu(msg: Message):
     await msg.reply(
         "<b>📋 Меню</b>\n\n"
-        "• <code>/convert</code> — нажми, потом пришли ссылку (рекомендуется)\n"
-        "• Отправь ссылку прямо в чат — бот автоматически добавит в очередь\n"
+        "• <code>/convert</code> — нажми, потом пришли ссылку (удобно)\n"
+        "• Отправь ссылку прямо в чат — бот добавит её в очередь\n"
         "• <code>/premium</code> — тарифы и покупка\n"
-        "• <code>/status</code> — проверить твой премиум\n"
-        "• <code>/info</code> — о боте\n"
-        "Админ: команды доступны только владельцу бота.",
-        parse_mode="HTML", disable_web_page_preview=True)
+        "• <code>/status</code> — статус премиума\n"
+        "• <code>/info</code> — о боте\n",
+        parse_mode="HTML", disable_web_page_preview=True
+    )
 
 @dp.message(Command("info"))
 async def cmd_info(msg: Message):
@@ -337,7 +328,8 @@ async def cmd_info(msg: Message):
         "• Не хранит файлы на сервере — использует прямые URL.\n"
         "• Приоритет обработки: <b>DIAMOND → GOLD → Обычные</b>.\n"
         "• YouTube Shorts не поддерживаются.",
-        parse_mode="HTML", disable_web_page_preview=True)
+        parse_mode="HTML", disable_web_page_preview=True
+    )
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
@@ -349,23 +341,24 @@ async def cmd_premium(msg: Message):
         "<b>💎 Тарифы</b>\n\n"
         "• <b>Обычный</b> — бесплатно (4 ссылки/день)\n"
         f"• <b>GOLD</b> — {GOLD_STARS}⭐ (30 дн) — 10 ссылок/день\n"
-        f"• <b>DIAMOND</b> — {DIAMOND_STARS}⭐ (90 дн) — приоритетная обработка, безлимит\n\n"
+        f"• <b>DIAMOND</b> — {DIAMOND_STARS}⭐ (90 дн) — приоритет, безлимит\n\n"
         "Нажми кнопку, чтобы оплатить:",
-        reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+        reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True
+    )
 
 @dp.callback_query(F.data == "buy_gold")
 async def cb_buy_gold(call: CallbackQuery):
     prices = [LabeledPrice(label=f"GOLD ({GOLD_DAYS} дней)", amount=GOLD_STARS)]
     try:
         await bot.send_invoice(call.from_user.id,
-                       title="GOLD Premium",
-                       description=f"{GOLD_DAYS} дней GOLD",
-                       payload=f"gold:{call.from_user.id}",
-                       provider_token=PROVIDER_TOKEN or "",
-                       currency=CURRENCY,
-                       prices=prices)
+                               title="GOLD Premium",
+                               description=f"{GOLD_DAYS} дней GOLD",
+                               payload=f"gold:{call.from_user.id}",
+                               provider_token=PROVIDER_TOKEN or "",
+                               currency=CURRENCY,
+                               prices=prices)
     except Exception as e:
-        await call.message.reply(f"❌ Не удалось создать инвойс: {e}", parse_mode="HTML")
+        await call.message.reply(f"❌ Не удалось создать счёт: {e}", parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data == "buy_diamond")
@@ -373,14 +366,14 @@ async def cb_buy_diamond(call: CallbackQuery):
     prices = [LabeledPrice(label=f"DIAMOND ({DIAMOND_DAYS} дней)", amount=DIAMOND_STARS)]
     try:
         await bot.send_invoice(call.from_user.id,
-                       title="DIAMOND Premium",
-                       description=f"{DIAMOND_DAYS} дней DIAMOND",
-                       payload=f"diamond:{call.from_user.id}",
-                       provider_token=PROVIDER_TOKEN or "",
-                       currency=CURRENCY,
-                       prices=prices)
+                               title="DIAMOND Premium",
+                               description=f"{DIAMOND_DAYS} дней DIAMOND",
+                               payload=f"diamond:{call.from_user.id}",
+                               provider_token=PROVIDER_TOKEN or "",
+                               currency=CURRENCY,
+                               prices=prices)
     except Exception as e:
-        await call.message.reply(f"❌ Не удалось создать инвойс: {e}", parse_mode="HTML")
+        await call.message.reply(f"❌ Не удалось создать счёт: {e}", parse_mode="HTML")
     await call.answer()
 
 @dp.pre_checkout_query()
@@ -405,7 +398,6 @@ async def on_successful_payment(msg: Message):
         await msg.reply("<b>🔥 Оплата принята — DIAMOND активирован!</b>", parse_mode="HTML")
     else:
         await msg.reply("<b>✅ Оплата принята!</b>", parse_mode="HTML")
-    # notify admin
     try:
         await bot.send_message(ADMIN_ID, f"Пользователь @{msg.from_user.username or msg.from_user.id} купил {level.upper()}")
     except Exception:
@@ -421,7 +413,7 @@ async def cmd_status(msg: Message):
     expiry = row[3] or "—"
     await msg.reply(f"<b>Текущий премиум:</b> {level}\n<b>Истекает:</b> {expiry}", parse_mode="HTML")
 
-# admin-only helpers
+# admin commands (only ADMIN_ID)
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -487,13 +479,13 @@ async def cmd_stats(msg: Message):
     s = await get_stats()
     await msg.reply(f"⭐ <b>Всего звёзд:</b> {s[0]}\n<b>GOLD покупок:</b> {s[1]}\n<b>DIAMOND покупок:</b> {s[2]}\n<b>Всего покупок:</b> {s[3]}", parse_mode="HTML")
 
-# ---------------- /convert flow ----------------
+# /convert
 @dp.message(Command("convert"))
 async def cmd_convert(msg: Message):
     awaiting_link[msg.from_user.id] = True
-    await msg.reply("📩 <b>Пришли ссылку на TikTok или Instagram</b>. Бот конвертирует ссылку в медиа и пришлёт готовое видео / фото+музыку.", parse_mode="HTML", disable_web_page_preview=True)
+    await msg.reply("📩 <b>Пришли ссылку на TikTok или Instagram</b>. Бот обработает и отправит медиа.", parse_mode="HTML", disable_web_page_preview=True)
 
-# ---------------- Incoming links handler (enqueue) ----------------
+# incoming links handler (enqueue)
 @dp.message()
 async def handle_incoming(msg: Message):
     text = (msg.text or "").strip()
@@ -528,10 +520,10 @@ async def handle_incoming(msg: Message):
     if level == "diamond":
         await msg.reply("⚡ <b>Ваш запрос будет обработан с приоритетом.</b>", parse_mode="HTML")
 
-# ---------------- Startup ----------------
+# ---------------- startup ----------------
 async def main():
     await init_db()
-    # register commands using keyword args to be safe with aiogram versions
+    # register commands
     await bot.set_my_commands([
         BotCommand(command="menu", description="Меню"),
         BotCommand(command="info", description="О боте"),
