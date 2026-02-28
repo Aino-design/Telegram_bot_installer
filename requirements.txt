@@ -1,4 +1,4 @@
-aiogram
-aiosqlite
-yt-dlp
-aiohttp
+aiogram==3.25.0
+aiosqlite==0.19.0
+yt-dlp==2026.2.21
+aiohttp>=3.9.0,<3.14.0
