@@ -1,33 +1,46 @@
-# main.py (исправленный — совместим с aiogram 3.x)
+# main.py
+"""
+Ultra-PRO Telegram bot (aiogram 3.x)
+- TikTok / Instagram -> direct video or photo+music sending (no permanent disk storage)
+- Priority async queue (diamond -> gold -> normal)
+- /convert command: send link after it — bot converts link -> media and sends
+- Premium: none / gold / diamond (120★ / 250★)
+- Payments via Telegram invoices (Stars) (PROVIDER_TOKEN optional)
+- Admin commands visible only to ADMIN_ID
+- SQLite (aiosqlite) async storage
+- Nicely formatted messages (HTML)
+"""
+
+import os
 import asyncio
+import itertools
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+
 import aiosqlite
 import yt_dlp
 import aiohttp
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-import os
-import itertools
-from typing import Optional, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, CallbackQuery, BotCommand,
+    InlineKeyboardMarkup, InlineKeyboardButton,
     LabeledPrice, PreCheckoutQuery, InputMediaPhoto
 )
 
-# ====== CONFIG ======
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"
-PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")  # пустая строка для Stars
-CURRENCY = "XTR"
+PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")  # или оставь пустым для Stars
+CURRENCY = "XTR"  # Stars currency
 
-ADMIN_ID = 6705555401  # твой админ ID
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 6705555401))  # твой числовой Telegram ID
 
 DB_PATH = "users.db"
+WORKER_COUNT = 3  # параллельных воркера
 
-WORKER_COUNT = 3  # число параллельных обработчиков очереди
-
-# Premium settings
+# premium settings
 GOLD_STARS = 120
 GOLD_DAYS = 30
 DIAMOND_STARS = 250
@@ -39,11 +52,11 @@ LIMITS = {
     "diamond": None
 }
 
-# ====== BOT init ======
-bot = Bot(BOT_TOKEN)
+# ---------------- bot init ----------------
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# ====== Queue with priority ======
+# ---------------- queue ----------------
 priority_counter = itertools.count()
 
 @dataclass(order=True)
@@ -55,9 +68,12 @@ class JobItem:
     url: str = field(compare=False)
     requested_at: datetime = field(compare=False)
 
-queue: "asyncio.PriorityQueue" = asyncio.PriorityQueue()
+queue: "asyncio.PriorityQueue[Tuple[int,int,JobItem]]" = asyncio.PriorityQueue()
 
-# ====== Database helpers ======
+# for /convert flow: mark user expecting a link next
+awaiting_link: dict[int, bool] = {}
+
+# ---------------- database ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -72,7 +88,7 @@ async def init_db():
         """)
         await db.execute("""
         CREATE TABLE IF NOT EXISTS stats (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
+            id INTEGER PRIMARY KEY CHECK(id = 1),
             total_stars INTEGER DEFAULT 0,
             gold_count INTEGER DEFAULT 0,
             diamond_count INTEGER DEFAULT 0,
@@ -81,7 +97,7 @@ async def init_db():
         """)
         cur = await db.execute("SELECT COUNT(*) FROM stats")
         row = await cur.fetchone()
-        if row[0] == 0:
+        if row is None or row[0] == 0:
             await db.execute("INSERT INTO stats (id) VALUES (1)")
         await db.commit()
 
@@ -93,11 +109,21 @@ async def ensure_user(user_id: int, username: Optional[str] = None):
         )
         await db.commit()
 
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, premium_level, premium_expires, downloads_today, last_reset FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            return await cur.fetchone()
+
 async def set_premium(user_id: int, level: str, days: int):
     expires = (datetime.utcnow() + timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET premium_level=?, premium_expires=? WHERE user_id=?",
-                         (level, expires, user_id))
+        await db.execute(
+            "UPDATE users SET premium_level=?, premium_expires=? WHERE user_id=?",
+            (level, expires, user_id)
+        )
         if level == "gold":
             await db.execute("UPDATE stats SET total_stars = total_stars + ?, gold_count = gold_count + 1, total_purchases = total_purchases + 1 WHERE id=1", (GOLD_STARS,))
         elif level == "diamond":
@@ -108,12 +134,6 @@ async def revoke_premium(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET premium_level='none', premium_expires='' WHERE user_id=?", (user_id,))
         await db.commit()
-
-async def get_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, username, premium_level, premium_expires, downloads_today, last_reset FROM users WHERE user_id=?", (user_id,)) as cur:
-            row = await cur.fetchone()
-            return row
 
 async def reset_daily_if_needed(user_id: int):
     row = await get_user(user_id)
@@ -136,7 +156,7 @@ async def get_stats():
         async with db.execute("SELECT total_stars, gold_count, diamond_count, total_purchases FROM stats WHERE id=1") as cur:
             return await cur.fetchone()
 
-# ====== Utils ======
+# ---------------- helpers ----------------
 def is_youtube_url(url: str) -> bool:
     if not url: return False
     u = url.lower()
@@ -148,16 +168,17 @@ def priority_for_level(level: str) -> int:
     return 2
 
 def choose_video_url(info: dict) -> Optional[str]:
-    if info is None:
+    if not info:
         return None
-    if info.get("url") and info.get("ext") in ("mp4","mov","m4a","m4v","webm"):
+    # direct url
+    if info.get("url") and info.get("ext") and info.get("ext") in ("mp4","mov","m4a","m4v","webm"):
         return info.get("url")
     formats = info.get("formats") or []
     mp4s = [f for f in formats if f.get("ext") in ("mp4","m4v","mov","webm")]
     if mp4s:
         def score(f):
             s = 0
-            if f.get("height"): s += f.get("height")
+            if f.get("height"): s += int(f.get("height") or 0)
             if f.get("tbr"): s += int(f.get("tbr") or 0)
             return s
         best = max(mp4s, key=score)
@@ -174,22 +195,22 @@ def extract_photos_from_info(info: dict) -> List[str]:
         for e in info["entries"]:
             if e.get("url") and e.get("ext") and e["ext"] in ("jpg","png","webp"):
                 urls.append(e["url"])
-            for t in e.get("thumbnails", [])[:5]:
+            for t in e.get("thumbnails", [])[:6]:
                 if t.get("url"):
                     urls.append(t["url"])
-    for t in info.get("thumbnails", [])[:5]:
+    for t in info.get("thumbnails", [])[:6]:
         if t.get("url"):
             urls.append(t["url"])
     if info.get("image"):
         urls.append(info.get("image"))
-    seen = []
+    # dedupe preserve order
+    seen = set()
     out = []
     for u in urls:
         if u and u not in seen:
-            seen.append(u); out.append(u)
+            seen.add(u); out.append(u)
     return out
 
-# ====== yt-dlp extract info (async-friendly) ======
 async def ytdl_extract(url: str):
     loop = asyncio.get_event_loop()
     def run():
@@ -198,13 +219,13 @@ async def ytdl_extract(url: str):
             "no_warnings": True,
             "skip_download": True,
             "force_generic_extractor": False,
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
     return await loop.run_in_executor(None, run)
 
-# ====== Worker ======
+# ---------------- worker ----------------
 async def worker_task(worker_id: int):
     session = aiohttp.ClientSession()
     try:
@@ -219,31 +240,41 @@ async def worker_task(worker_id: int):
                 premium_level = row[2] if row else "none"
                 lim = LIMITS.get(premium_level)
                 if lim is not None and row and row[4] >= lim:
-                    await bot.send_message(chat_id, "❌ Дневной лимит скачиваний исчерпан.")
-                    queue.task_done(); continue
+                    await bot.send_message(chat_id, "<b>❌ Дневной лимит скачиваний исчерпан.</b>")
+                    queue.task_done()
+                    continue
 
-                info = await ytdl_extract(url)
+                try:
+                    info = await ytdl_extract(url)
+                except Exception as e:
+                    # network or yt-dlp error — inform user nicely
+                    await bot.send_message(chat_id, f"❌ <b>Ошибка при обработке ссылки:</b>\n<code>{str(e)}</code>\nПопробуй позже или отправь полную ссылку на пост (не короткую).")
+                    queue.task_done()
+                    continue
+
                 if not info:
-                    await bot.send_message(chat_id, "❌ Не удалось получить информацию о медиа.")
+                    await bot.send_message(chat_id, "❌ <b>Не удалось получить информацию о медиа.</b>")
                     queue.task_done(); continue
 
                 if isinstance(info.get("entries"), list) and info.get("entries"):
                     info = info["entries"][0]
 
+                # photos (carousel / image post)
                 photos = extract_photos_from_info(info)
                 if photos:
-                    medias = []
-                    for p in photos[:10]:
-                        medias.append(InputMediaPhoto(media=p))
+                    # send as media groups (up to 10)
+                    medias = [InputMediaPhoto(media=p) for p in photos[:10]]
                     try:
                         for i in range(0, len(medias), 10):
                             await bot.send_media_group(chat_id, medias[i:i+10])
                     except Exception:
+                        # fallback: individual photos
                         for p in photos[:10]:
                             try:
                                 await bot.send_photo(chat_id, p)
                             except Exception:
                                 pass
+                    # try audio if any
                     music = None
                     music_meta = info.get("music") or info.get("audio") or info.get("track")
                     if isinstance(music_meta, dict):
@@ -258,6 +289,7 @@ async def worker_task(worker_id: int):
                     queue.task_done()
                     continue
 
+                # video
                 video_url = choose_video_url(info)
                 if video_url:
                     try:
@@ -265,72 +297,91 @@ async def worker_task(worker_id: int):
                         await bot.send_video(chat_id, video_url, supports_streaming=True, caption=info.get("title") or "")
                         await increment_download(user_id)
                     except Exception:
+                        # fallback to sending url
                         await bot.send_message(chat_id, f"✅ Вот ссылка на медиа:\n{video_url}")
                         await increment_download(user_id)
                 else:
-                    await bot.send_message(chat_id, "❌ Не найдено видео/фото в ссылке.")
+                    await bot.send_message(chat_id, "❌ <b>Не найдено видео/фото в ссылке.</b>")
             except Exception as e:
-                await bot.send_message(chat_id, f"❌ Ошибка при обработке ссылки: {e}")
+                await bot.send_message(chat_id, f"❌ <b>Ошибка при обработке ссылки:</b> {e}")
             finally:
                 queue.task_done()
     finally:
         await session.close()
 
-# ====== Command handlers ======
+# ---------------- commands ----------------
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.username)
-    await msg.reply("🤖 Ultra-PRO Bot запущен!\n\nНаберите /menu чтобы увидеть команды.")
+    await msg.reply(
+        "<b>🤖 Добро пожаловать в Ultra-PRO Bot</b>\n\n"
+        "Отправь ссылку на TikTok или Instagram — бот пришлёт готовое видео / фото+музыку.\n\n"
+        "Используй <code>/menu</code> для управления и информации.",
+        disable_web_page_preview=True
+    )
 
 @dp.message(Command("menu"))
 async def cmd_menu(msg: Message):
     await msg.reply(
-        "📋 Меню:\n"
-        "/info — информация о боте\n"
-        "/premium — тарифы\n"
-        "/buy — купить премиум\n"
-        "/status — проверить статус премиума\n"
-        "/gift <user_id> <gold|diamond> [days] — (админ) подарить премиум\n"
-        "/revoke <user_id> — (админ) снять премиум\n"
-        "/stats — (админ) статистика\n\n"
-        "Просто отправь ссылку на TikTok или Instagram, бот добавит её в очередь и пришлёт готовое медиа."
+        "<b>📋 Меню</b>\n\n"
+        "• <code>/convert</code> — нажми, потом пришли ссылку (рекомендуется)\n"
+        "• Отправь ссылку прямо в чат — бот автоматически добавит в очередь\n"
+        "• <code>/premium</code> — тарифы и покупка\n"
+        "• <code>/status</code> — проверить твой премиум\n"
+        "• <code>/info</code> — о боте\n"
+        "Админ: команды доступны только владельцу бота.",
+        disable_web_page_preview=True
     )
 
 @dp.message(Command("info"))
 async def cmd_info(msg: Message):
     await msg.reply(
-        "Я отправляю готовое видео или фото-пост (фото + музыка) по ссылке.\n"
-        "Не сохраняю файлы на сервере — работаю через прямые URL.\n"
-        "YouTube Shorts не поддерживаются."
+        "<b>ℹ️ О боте</b>\n\n"
+        "• Отправляет видео / фото-посты по ссылке (TikTok / Instagram).\n"
+        "• Не хранит файлы на сервере — использует прямые URL.\n"
+        "• Приоритет обработки: <b>DIAMOND → GOLD → Обычные</b>.\n"
+        "• YouTube Shorts не поддерживаются.",
+        disable_web_page_preview=True
     )
 
 @dp.message(Command("premium"))
 async def cmd_premium(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Купить GOLD — {GOLD_STARS}⭐ (30 дн)", callback_data="buy_gold")],
+        [InlineKeyboardButton(text=f"Купить DIAMOND — {DIAMOND_STARS}⭐ (90 дн)", callback_data="buy_diamond")],
+    ])
     await msg.reply(
-        "💎 Тарифы:\n"
-        f"• GOLD — {GOLD_STARS} ⭐ (30 дней) — быстрый доступ\n"
-        f"• DIAMOND — {DIAMOND_STARS} ⭐ (90 дней) — приоритетная обработка\n"
-        "Нажми /buy чтобы оплатить."
+        "<b>💎 Тарифы</b>\n\n"
+        "• <b>Обычный</b> — бесплатно (4 ссылки/день)\n"
+        f"• <b>GOLD</b> — {GOLD_STARS}⭐ (30 дн) — 10 ссылок/день\n"
+        f"• <b>DIAMOND</b> — {DIAMOND_STARS}⭐ (90 дн) — приоритетная обработка, безлимит\n\n"
+        "Нажми кнопку, чтобы оплатить:",
+        reply_markup=kb,
+        disable_web_page_preview=True
     )
 
-@dp.message(Command("buy"))
-async def cmd_buy(msg: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Купить GOLD — {GOLD_STARS}⭐ (30d)", callback_data="buy_gold")],
-        [InlineKeyboardButton(text=f"Купить DIAMOND — {DIAMOND_STARS}⭐ (90d)", callback_data="buy_diamond")]
-    ])
-    await msg.reply("Выберите тариф для покупки:", reply_markup=kb)
-
 @dp.callback_query(F.data == "buy_gold")
-async def on_buy_gold(call: CallbackQuery):
+async def cb_buy_gold(call: CallbackQuery):
     prices = [LabeledPrice(label=f"GOLD ({GOLD_DAYS} дней)", amount=GOLD_STARS)]
-    await bot.send_invoice(call.from_user.id, title="GOLD Premium", description=f"{GOLD_DAYS} дней", payload=f"gold:{call.from_user.id}", provider_token=PROVIDER_TOKEN or "", currency=CURRENCY, prices=prices)
+    await bot.send_invoice(call.from_user.id,
+                           title="GOLD Premium",
+                           description=f"{GOLD_DAYS} дней GOLD",
+                           payload=f"gold:{call.from_user.id}",
+                           provider_token=PROVIDER_TOKEN or "",
+                           currency=CURRENCY,
+                           prices=prices)
     await call.answer()
 
 @dp.callback_query(F.data == "buy_diamond")
-async def on_buy_diamond(call: CallbackQuery):
+async def cb_buy_diamond(call: CallbackQuery):
     prices = [LabeledPrice(label=f"DIAMOND ({DIAMOND_DAYS} дней)", amount=DIAMOND_STARS)]
-    await bot.send_invoice(call.from_user.id, title="DIAMOND Premium", description=f"{DIAMOND_DAYS} дней", payload=f"diamond:{call.from_user.id}", provider_token=PROVIDER_TOKEN or "", currency=CURRENCY, prices=prices)
+    await bot.send_invoice(call.from_user.id,
+                           title="DIAMOND Premium",
+                           description=f"{DIAMOND_DAYS} дней DIAMOND",
+                           payload=f"diamond:{call.from_user.id}",
+                           provider_token=PROVIDER_TOKEN or "",
+                           currency=CURRENCY,
+                           prices=prices)
     await call.answer()
 
 @dp.pre_checkout_query()
@@ -347,14 +398,17 @@ async def on_successful_payment(msg: Message):
     except Exception:
         uid = msg.from_user.id
         level = payload or "gold"
+
     if level == "gold":
         await set_premium(uid, "gold", GOLD_DAYS)
-        await msg.reply("✅ Оплата принята — GOLD активирован!")
+        await msg.reply("<b>✅ Оплата принята — GOLD активирован!</b>")
     elif level == "diamond":
         await set_premium(uid, "diamond", DIAMOND_DAYS)
-        await msg.reply("🔥 Оплата принята — DIAMOND активирован!")
+        await msg.reply("<b>🔥 Оплата принята — DIAMOND активирован!</b>")
     else:
-        await msg.reply("✅ Оплата принята!")
+        await msg.reply("<b>✅ Оплата принята!</b>")
+
+    # notify admin
     try:
         await bot.send_message(ADMIN_ID, f"Пользователь @{msg.from_user.username or msg.from_user.id} купил {level.upper()}")
     except Exception:
@@ -364,55 +418,60 @@ async def on_successful_payment(msg: Message):
 async def cmd_status(msg: Message):
     row = await get_user(msg.from_user.id)
     if not row:
-        await msg.reply("Пользователь не найден.")
+        await msg.reply("<b>Пользователь не найден.</b>")
         return
     level = row[2]
     expiry = row[3] or "—"
-    await msg.reply(f"Текущий премиум: {level}\nИстекает: {expiry}")
+    await msg.reply(f"<b>Текущий премиум:</b> {level}\n<b>Истекает:</b> {expiry}")
+
+# admin-only commands
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 @dp.message(Command("gift"))
 async def cmd_gift(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
+        await msg.reply("❌ <b>Только админ может использовать эту команду.</b>")
         return
     parts = msg.text.split()
     if len(parts) < 3:
-        await msg.reply("Использование: /gift <user_id> <gold|diamond> [days]")
+        await msg.reply("Использование: <code>/gift &lt;user_id&gt; &lt;gold|diamond&gt; [days]</code>")
         return
     try:
         target = int(parts[1])
         level = parts[2]
-        days = int(parts[3]) if len(parts) >= 4 else (GOLD_DAYS if level=="gold" else DIAMOND_DAYS)
+        days = int(parts[3]) if len(parts) >= 4 else (GOLD_DAYS if level == "gold" else DIAMOND_DAYS)
         await set_premium(target, level, days)
-        await msg.reply(f"✅ Выдан {level} пользователю {target} на {days} дней")
+        await msg.reply(f"✅ Выдан <b>{level.upper()}</b> пользователю <code>{target}</code> на {days} дней")
         try:
-            await bot.send_message(target, f"🎁 Тебе подарили премиум: {level} на {days} дней (админ)")
-        except:
+            await bot.send_message(target, f"🎁 Тебе подарили премиум: <b>{level}</b> на {days} дней (админ)")
+        except Exception:
             pass
     except Exception as e:
         await msg.reply(f"Ошибка: {e}")
 
 @dp.message(Command("revoke"))
 async def cmd_revoke(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split()
     if len(parts) < 2:
-        await msg.reply("Использование: /revoke <user_id>")
+        await msg.reply("Использование: <code>/revoke &lt;user_id&gt;</code>")
         return
     try:
         target = int(parts[1])
         await revoke_premium(target)
-        await msg.reply(f"✅ Премиум снят у {target}")
+        await msg.reply(f"✅ Премиум снят у <code>{target}</code>")
     except Exception as e:
         await msg.reply(f"Ошибка: {e}")
 
 @dp.message(Command("check"))
 async def cmd_check(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split()
     if len(parts) < 2:
-        await msg.reply("Использование: /check <user_id>")
+        await msg.reply("Использование: <code>/check &lt;user_id&gt;</code>")
         return
     try:
         target = int(parts[1])
@@ -420,25 +479,41 @@ async def cmd_check(msg: Message):
         if not row:
             await msg.reply("Пользователь не найден.")
             return
-        await msg.reply(f"Пользователь: {target}\nПремиум: {row[2]}\nИстекает: {row[3]}")
+        await msg.reply(f"Пользователь: <code>{target}</code>\nПремиум: {row[2]}\nИстекает: {row[3]}")
     except Exception as e:
         await msg.reply(f"Ошибка: {e}")
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     s = await get_stats()
-    await msg.reply(f"⭐ Всего звёзд: {s[0]}\nGOLD покупок: {s[1]}\nDIAMOND покупок: {s[2]}\nВсего покупок: {s[3]}")
+    await msg.reply(f"⭐ <b>Всего звёзд:</b> {s[0]}\n<b>GOLD покупок:</b> {s[1]}\n<b>DIAMOND покупок:</b> {s[2]}\n<b>Всего покупок:</b> {s[3]}")
 
-# ====== Incoming link handler (enqueue) ======
+# ---------------- /convert flow ----------------
+@dp.message(Command("convert"))
+async def cmd_convert(msg: Message):
+    awaiting_link[msg.from_user.id] = True
+    await msg.reply("📩 <b>Пришли ссылку на TikTok или Instagram</b>. Бот конвертирует ссылку в медиа и пришлёт готовое видео / фото+музыку.")
+
+# ---------------- incoming link handler (enqueue) ----------------
 @dp.message()
 async def handle_incoming(msg: Message):
     text = (msg.text or "").strip()
-    if not text.startswith("http"):
+    if not text:
         return
+
+    # First: handle /convert waiting
+    if awaiting_link.get(msg.from_user.id):
+        awaiting_link[msg.from_user.id] = False
+        text = text.strip()
+
+    # only process http links
+    if not text.startswith("http"):
+        return  # ignore non-link messages
+
     if is_youtube_url(text):
-        await msg.reply("❌ YouTube Shorts не поддерживаются.")
+        await msg.reply("❌ <b>YouTube Shorts не поддерживаются.</b>")
         return
 
     await ensure_user(msg.from_user.id, msg.from_user.username)
@@ -447,27 +522,30 @@ async def handle_incoming(msg: Message):
     level = user[2] if user else "none"
     lim = LIMITS.get(level)
     if lim is not None and user and user[4] >= lim:
-        await msg.reply("❌ Дневной лимит скачиваний исчерпан.")
+        await msg.reply("❌ <b>Дневной лимит скачиваний исчерпан.</b>")
         return
 
     p = priority_for_level(level)
     cnt = next(priority_counter)
     job = JobItem(priority=p, count=cnt, user_id=msg.from_user.id, chat_id=msg.chat.id, url=text, requested_at=datetime.utcnow())
     await queue.put((job.priority, job.count, job))
-    await msg.reply(f"⏳ Ссылка добавлена в очередь (приоритет: {level}).")
+    await msg.reply(f"⏳ <b>Ссылка добавлена в очередь (приоритет: {level}).</b>")
     if level == "diamond":
-        await msg.reply("⚡ Ваш запрос будет обработан с приоритетом.")
+        await msg.reply("⚡ <b>Ваш запрос будет обработан с приоритетом.</b>")
 
-# ====== Start workers and bot ======
+# ---------------- startup ----------------
 async def main():
     await init_db()
+    # register commands (use keyword args for BotCommand to avoid aiogram version issues)
     await bot.set_my_commands([
         BotCommand(command="menu", description="Меню"),
         BotCommand(command="info", description="О боте"),
         BotCommand(command="premium", description="Тарифы"),
         BotCommand(command="buy", description="Купить премиум"),
         BotCommand(command="status", description="Статус премиума"),
+        BotCommand(command="convert", description="Конвертировать ссылку → медиа"),
     ])
+    # start workers
     for i in range(WORKER_COUNT):
         asyncio.create_task(worker_task(i+1))
     print("Ultra-PRO bot started")
