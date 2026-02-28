@@ -142,8 +142,8 @@ async def profile_handler(m: Message):
 async def premium_handler(m: Message):
     await m.answer(
         f"💎 Премиум:\n"
-        f"🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n"
-        f"💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\n\n"
+        f"🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n" + "4 видео в день -- качество обычное"
+        f"💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\n\n" + "неограниченные видео в день -- высокое разрашение -- приоритет на загрузку"
         "Команды:\n/buy_gold\n/buy_diamond"
     )
 
