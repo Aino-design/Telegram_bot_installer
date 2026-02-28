@@ -14,7 +14,7 @@ from aiogram.types import Message, FSInputFile
 
 # ================= CONFIG =================
 
-TOKEN = "8736949755:AAG8So7fVUlyNpJxmGQptWQNk5bx7kjPoLs"
+TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = [6705555401]
 
 DB = "users.db"
