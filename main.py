@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 
-TOKEN = "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"
+TOKEN = os.getenv("TOKEN")
 ADMIN_ID = 6705555401
 
 # ⭐ Stars token = пустая строка
