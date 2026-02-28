@@ -26,7 +26,7 @@ DIAMOND_DAYS = 90
 
 LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
-bot = Bot(TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 queue = asyncio.Queue()
 
