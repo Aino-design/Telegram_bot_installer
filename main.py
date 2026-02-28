@@ -17,87 +17,27 @@ ADMIN_ID = 6705555401  # <- твой Telegram ID
 DB_PATH = "bot_db.sqlite"
 
 # ---------- yt-dlp настройки ----------
-def download_media(url, folder):
-    ydl_opts = {
-        "outtmpl": f"{folder}/%(id)s.%(ext)s",
-        "quiet": True,
-        "noplaylist": True,
-        "format": "best",
-        "http_headers": {"User-Agent": "Mozilla/5.0"}
-    }
+import subprocess
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return info
+async def photos_to_video(photos: list, output: str, fps=1):
+    # создаём текстовый файл со списком фото
+    with open("photos.txt", "w") as f:
+        for p in photos:
+            f.write(f"file '{p}'\n")
+            f.write(f"duration {1/fps}\n")  # 1 секунда на фото
 
-
-# ---------- извлечение аудио ----------
-async def extract_audio(video_path, audio_path):
     cmd = [
         "ffmpeg",
         "-y",
-        "-i", video_path,
-        "-vn",
-        "-acodec", "mp3",
-        audio_path
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "photos.txt",
+        "-vf", f"fps={fps}",
+        "-pix_fmt", "yuv420p",
+        output
     ]
     process = await asyncio.create_subprocess_exec(*cmd)
     await process.communicate()
-
-
-# ---------- основная обработка ----------
-async def process_link(bot, chat_id, url):
-    tmp = tempfile.mkdtemp()
-
-    try:
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, download_media, url, tmp)
-
-        files = os.listdir(tmp)
-
-        # ---------- если это карусель фото ----------
-        if "entries" in info:
-            photos = []
-            video_file = None
-
-            for f in files:
-                path = os.path.join(tmp, f)
-                if f.endswith(("jpg", "png", "webp")):
-                    photos.append(path)
-                elif f.endswith(("mp4", "mkv", "webm")):
-                    video_file = path
-
-            # отправляем фото
-            for p in photos:
-                await bot.send_photo(chat_id, FSInputFile(p))
-
-            # если есть музыка (видео содержит звук)
-            if video_file:
-                audio = os.path.join(tmp, "music.mp3")
-                await extract_audio(video_file, audio)
-                await bot.send_audio(chat_id, FSInputFile(audio))
-
-            return
-
-
-        # ---------- если обычное видео ----------
-        video_path = None
-        for f in files:
-            if f.endswith(("mp4", "webm", "mkv")):
-                video_path = os.path.join(tmp, f)
-                break
-
-        if video_path:
-            await bot.send_video(chat_id, FSInputFile(video_path))
-
-        else:
-            await bot.send_message(chat_id, "❌ Не удалось найти медиа")
-
-    except Exception as e:
-        await bot.send_message(chat_id, f"❌ Ошибка: {e}")
-
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 # Premium settings
 GOLD_PRICE = 120
 GOLD_DAYS = 30
