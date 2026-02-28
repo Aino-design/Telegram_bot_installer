@@ -132,6 +132,15 @@ async def start_handler(m: Message):
         "Отправь ссылку на TikTok,Instagram,YouTube и бот скачает видео."
     )
 
+@dp.message(Command("menu"))
+async def start_handler(m: Message):
+    await add_user(m.from_user.id)
+    await m.answer(
+        "🔥TikGram_installer_bot\n\n"
+        "Отправь ссылку на TikTok,Instagram,YouTube и бот скачает видео."
+    )
+
+
 
 @dp.message(Command("profile"))
 async def profile_handler(m: Message):
