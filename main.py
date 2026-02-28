@@ -16,6 +16,88 @@ TOKEN = "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8" or os.getenv("TOKEN")
 ADMIN_ID = 6705555401  # <- твой Telegram ID
 DB_PATH = "bot_db.sqlite"
 
+# ---------- yt-dlp настройки ----------
+def download_media(url, folder):
+    ydl_opts = {
+        "outtmpl": f"{folder}/%(id)s.%(ext)s",
+        "quiet": True,
+        "noplaylist": True,
+        "format": "best",
+        "http_headers": {"User-Agent": "Mozilla/5.0"}
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return info
+
+
+# ---------- извлечение аудио ----------
+async def extract_audio(video_path, audio_path):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "mp3",
+        audio_path
+    ]
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.communicate()
+
+
+# ---------- основная обработка ----------
+async def process_link(bot, chat_id, url):
+    tmp = tempfile.mkdtemp()
+
+    try:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, download_media, url, tmp)
+
+        files = os.listdir(tmp)
+
+        # ---------- если это карусель фото ----------
+        if "entries" in info:
+            photos = []
+            video_file = None
+
+            for f in files:
+                path = os.path.join(tmp, f)
+                if f.endswith(("jpg", "png", "webp")):
+                    photos.append(path)
+                elif f.endswith(("mp4", "mkv", "webm")):
+                    video_file = path
+
+            # отправляем фото
+            for p in photos:
+                await bot.send_photo(chat_id, FSInputFile(p))
+
+            # если есть музыка (видео содержит звук)
+            if video_file:
+                audio = os.path.join(tmp, "music.mp3")
+                await extract_audio(video_file, audio)
+                await bot.send_audio(chat_id, FSInputFile(audio))
+
+            return
+
+
+        # ---------- если обычное видео ----------
+        video_path = None
+        for f in files:
+            if f.endswith(("mp4", "webm", "mkv")):
+                video_path = os.path.join(tmp, f)
+                break
+
+        if video_path:
+            await bot.send_video(chat_id, FSInputFile(video_path))
+
+        else:
+            await bot.send_message(chat_id, "❌ Не удалось найти медиа")
+
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Ошибка: {e}")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 # Premium settings
 GOLD_PRICE = 120
 GOLD_DAYS = 30
@@ -87,6 +169,12 @@ async def can_download(uid: int) -> bool:
 
 
 # ========= DOWNLOAD FUNCTION =========
+@dp.message(Command("convert"))
+async def start_handler(m: Message):
+    await add_user(m.from_user.id)
+    await m.answer(
+        "🔗Отправьте ссылку на видео и я обрабтую его я пришлю вам!"
+    )
 def download_video(url: str, folder: str):
     ydl_opts = {
         "format": "best[ext=mp4]/best",
@@ -122,8 +210,8 @@ async def download_worker():
 async def start_handler(m: Message):
     await add_user(m.from_user.id)
     await m.answer(
-        "🔥 <b>VIDEO DOWNLOADER PRO</b>\n\n"
-        "Отправь ссылку на TikTok или Instagram, и бот скачает видео."
+        "🔥TikGram_installer_bot\n\n"
+        "Отправь ссылку на TikTok,Instagram,YouTube и бот скачает видео."
     )
 
 
@@ -133,8 +221,6 @@ async def profile_handler(m: Message):
     await m.answer(
         f"👤 Профиль\n"
         f"💎 {user[1]}\n"
-        f"⭐ Баланс: {user[2]}\n"
-        f"📥 Скачано сегодня: {user[3]}"
     )
 
 
@@ -142,11 +228,18 @@ async def profile_handler(m: Message):
 async def premium_handler(m: Message):
     await m.answer(
         f"💎 Премиум:\n"
-        f"🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n" + "4 видео в день -- качество обычное"
-        f"💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\n\n" + "неограниченные видео в день -- высокое разрашение -- приоритет на загрузку"
+        f"Обычный(по умолчанию)\n" f"4 видео в день обычное\n\n"
+        f"🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n" f"10 видео в день - хорошее разрешение\n\n"
+        f"💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\n" f"неограниченные видео в день - высокое разрешение - приоритет\n\n"
         "Команды:\n/buy_gold\n/buy_diamond"
     )
 
+@dp.message(Command("about"))
+async def about_handler(m: Message):
+    user = await get_user(m.from_user.id)
+    await m.answer(
+        f"🤖 бот может конвертировать ссылки в видео и отправлять вам "
+    )
 
 @dp.message(Command("buy_gold"))
 async def buy_gold(m: Message):
