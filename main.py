@@ -16,28 +16,6 @@ TOKEN = "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8" or os.getenv("TOKEN")
 ADMIN_ID = 6705555401  # <- твой Telegram ID
 DB_PATH = "bot_db.sqlite"
 
-# ---------- yt-dlp настройки ----------
-import subprocess
-
-async def photos_to_video(photos: list, output: str, fps=1):
-    # создаём текстовый файл со списком фото
-    with open("photos.txt", "w") as f:
-        for p in photos:
-            f.write(f"file '{p}'\n")
-            f.write(f"duration {1/fps}\n")  # 1 секунда на фото
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", "photos.txt",
-        "-vf", f"fps={fps}",
-        "-pix_fmt", "yuv420p",
-        output
-    ]
-    process = await asyncio.create_subprocess_exec(*cmd)
-    await process.communicate()
 # Premium settings
 GOLD_PRICE = 120
 GOLD_DAYS = 30
@@ -115,78 +93,18 @@ async def start_handler(m: Message):
     await m.answer(
         "🔗Отправьте ссылку на видео и я обрабтую его я пришлю вам!"
     )
-def run_yt_dlp_blocking(url: str, outdir: str):
+def download_video(url: str, folder: str):
     ydl_opts = {
-        "format": "best",
-        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "outtmpl": f"{folder}/video.%(ext)s",
+        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
-
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-    files = []
-    audio_file = None
-
-    # 🔹 если это карусель фото
-    if "entries" in info:
-        for entry in info["entries"]:
-            fname = os.path.join(outdir, f"{entry['id']}.{entry['ext']}")
-            if os.path.exists(fname):
-                files.append(fname)
-
-        # ищем музыку
-        if info.get("requested_formats"):
-            for f in info["requested_formats"]:
-                if f["vcodec"] == "none":
-                    audio_file = os.path.join(outdir, f"{info['id']}.{f['ext']}")
-
-    else:
-        fname = os.path.join(outdir, f"{info['id']}.{info['ext']}")
-        files.append(fname)
-
-    return files, audio_file
-
-def make_video_from_photos(photos, audio, outdir):
-    list_file = os.path.join(outdir, "list.txt")
-
-    with open(list_file, "w", encoding="utf-8") as f:
-        for p in photos:
-            f.write(f"file '{p}'\n")
-            f.write("duration 2\n")
-
-    video_no_audio = os.path.join(outdir, "video.mp4")
-    final_video = os.path.join(outdir, "final.mp4")
-
-    # делаем видео из фото
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-vsync", "vfr",
-        "-pix_fmt", "yuv420p",
-        video_no_audio
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # если есть звук — накладываем
-    if audio and os.path.exists(audio):
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", video_no_audio,
-            "-i", audio,
-            "-shortest",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            final_video
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        return final_video
-
-    return video_no_audio
+        ydl.download([url])
 
 
 async def download_worker():
