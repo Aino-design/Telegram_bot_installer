@@ -18,6 +18,182 @@ from aiogram.types import (
     LabeledPrice, PreCheckoutQuery, InputMediaPhoto
 )
 
+# Вставь в начало файла (если нет)
+import tempfile
+import shutil
+import os
+from aiogram.types import FSInputFile
+from yt_dlp import YoutubeDL
+
+# ------------------------------------------------
+# Вспомогательная функция: скачать медиа через yt-dlp в tmpdir
+# возвращает (local_filepath, info_dict)
+# ------------------------------------------------
+async def download_media_to_temp(url: str, timeout: int = 180) -> Tuple[Optional[str], Optional[dict]]:
+    """
+    Скачивает медиа через yt-dlp в временную папку и возвращает путь к файлу и info.
+    Работает в executor (блокирующий код yt-dlp).
+    """
+    loop = asyncio.get_event_loop()
+    tmpdir = tempfile.mkdtemp(prefix="bot_dl_")
+    def blocking_download():
+        # Опции: скачиваем лучший mp4, если возможно
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            # "progress_hooks": [hook],  # можно добавить если нужно
+        }
+        # Если у тебя есть cookiefile - добавь: ydl_opts["cookiefile"]=COOKIES_FILE
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename, info
+
+    try:
+        # Запустим в executor, ждём не более timeout (сек)
+        task = loop.run_in_executor(None, blocking_download)
+        filename, info = await asyncio.wait_for(task, timeout=timeout)
+        if filename and os.path.exists(filename):
+            return filename, info
+        # возможно yt-dlp сохранил в другом формате/имя — попытка найти любой файл в tmpdir
+        for f in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, f)
+            if os.path.isfile(p) and os.path.getsize(p) > 1000:
+                return p, info if 'info' in locals() else {}
+        # не нашёл корректного файла
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return None, None
+    except asyncio.TimeoutError:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+# ------------------------------------------------
+# Обновлённый worker_task: сначала пытается скачать + отправить видео как файл.
+# Если скачать не удалось — fallback: отправляет ссылку (как было).
+# ------------------------------------------------
+async def worker_task(worker_id: int):
+    session = aiohttp.ClientSession()
+    try:
+        while True:
+            priority, count, job = await queue.get()
+            user_id = job.user_id
+            chat_id = job.chat_id
+            url = job.url
+            try:
+                await reset_daily_if_needed(user_id)
+                row = await get_user(user_id)
+                premium_level = row[2] if row else "none"
+                lim = LIMITS.get(premium_level)
+                if lim is not None and row and row[4] >= lim:
+                    await bot.send_message(chat_id, "<b>❌ Дневной лимит скачиваний исчерпан.</b>", parse_mode="HTML")
+                    queue.task_done()
+                    continue
+
+                try:
+                    info = await ytdl_extract(url)
+                except Exception as e:
+                    await bot.send_message(chat_id,
+                        "<b>❌ Ошибка при обработке ссылки:</b>\n"
+                        f"<code>{str(e)}</code>\nПопробуйте позже или пришлите полную ссылку на пост.",
+                        parse_mode="HTML", disable_web_page_preview=True)
+                    queue.task_done()
+                    continue
+
+                if not info:
+                    await bot.send_message(chat_id, "<b>❌ Не удалось получить информацию о медиа.</b>", parse_mode="HTML")
+                    queue.task_done()
+                    continue
+
+                if isinstance(info.get("entries"), list) and info.get("entries"):
+                    info = info["entries"][0]
+
+                # Попробуем получить ссылку на видео (лучший вариант из formats)
+                video_url = choose_video_url(info)
+
+                if video_url:
+                    # Попытка 1: скачать медиа локально и отправить как файл (надежнее)
+                    try:
+                        # скачиваем в tmp и отправляем
+                        local_path, dl_info = await download_media_to_temp(url)
+                        if local_path and os.path.exists(local_path):
+                            try:
+                                await bot.send_chat_action(chat_id, "upload_video")
+                                await bot.send_video(chat_id, FSInputFile(local_path), supports_streaming=True,
+                                                     caption=(info.get("title") or ""), parse_mode="HTML")
+                                await increment_download(user_id)
+                            except Exception as send_err:
+                                # если не удалось отправить файл (редко), отправим прямую ссылку
+                                await bot.send_message(chat_id, f"✅ Не удалось загрузить файл напрямую, вот ссылка на медиа:\n{video_url}", disable_web_page_preview=True)
+                                await increment_download(user_id)
+                            finally:
+                                # cleanup локального файла и папки
+                                try:
+                                    parent = os.path.dirname(local_path)
+                                    if parent and parent.startswith(tempfile.gettempdir()):
+                                        shutil.rmtree(parent, ignore_errors=True)
+                                except Exception:
+                                    pass
+                            queue.task_done()
+                            continue
+                        else:
+                            # не скачалось — fallback ниже
+                            pass
+                    except Exception as dl_exc:
+                        # скачивание упало — логируем пользователю понятное сообщение и попробуем отправить ссылку
+                        await bot.send_message(chat_id,
+                            "<b>⚠️ Не удалось скачать видео автоматически.</b>\n"
+                            "Я попробую отправить прямую ссылку на медиа. Если и это не работает — пришлите полную ссылку на пост.",
+                            parse_mode="HTML", disable_web_page_preview=True)
+                        # (переходим к отправке ссылки как fallback)
+
+                    # fallback: отправляем прямую ссылку (если скачивание не удалось)
+                    await bot.send_message(chat_id, f"✅ Вот прямая ссылка на видео:\n{video_url}", disable_web_page_preview=True)
+                    await increment_download(user_id)
+                    queue.task_done()
+                    continue
+
+                # Если видео нет — пробуем фото (как раньше)
+                photos = extract_photos_from_info(info)
+                if photos:
+                    medias = [InputMediaPhoto(media=p) for p in photos[:10]]
+                    try:
+                        for i in range(0, len(medias), 10):
+                            await bot.send_media_group(chat_id, medias[i:i+10])
+                    except Exception:
+                        for p in photos[:10]:
+                            try:
+                                await bot.send_photo(chat_id, p)
+                            except Exception:
+                                pass
+                    music = None
+                    music_meta = info.get("music") or info.get("audio") or info.get("track")
+                    if isinstance(music_meta, dict):
+                        music = music_meta.get("url") or music_meta.get("play_url")
+                    if music:
+                        try:
+                            await bot.send_message(chat_id, "🎵 Музыка из поста:", parse_mode="HTML")
+                            await bot.send_audio(chat_id, music)
+                        except Exception:
+                            pass
+                    await increment_download(user_id)
+                    queue.task_done()
+                    continue
+
+                # ничего не найдено
+                await bot.send_message(chat_id, "<b>❌ Не найдено видео или фото в этой ссылке.</b>", parse_mode="HTML")
+            except Exception as e:
+                await bot.send_message(chat_id, f"<b>❌ Внутренняя ошибка при обработке ссылки:</b> {e}", parse_mode="HTML")
+            finally:
+                queue.task_done()
+    finally:
+        await session.close()
+
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"
 PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")  # оставить пустым если нет
