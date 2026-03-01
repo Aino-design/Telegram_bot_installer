@@ -11,7 +11,8 @@ from typing import Dict, Any, Optional, Tuple, List
 from functools import partial
 
 import aiosqlite
-from yt_dlp import YoutubeDL, DownloadError, ExtractorError
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError, ExtractorError
 import requests
 
 from aiogram import Bot, Dispatcher, F, types
