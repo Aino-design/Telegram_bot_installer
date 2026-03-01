@@ -91,7 +91,7 @@ async def can_download(uid: int) -> bool:
 async def start_handler(m: Message):
     await add_user(m.from_user.id)
     await m.answer(
-        "🔗Отправьте ссылку на видео и я обрабтую его я пришлю вам!"
+        "🔗Отправьте ссылку на видео и я обрабтую его и пришлю вам!"
     )
 def download_video(url: str, folder: str):
     ydl_opts = {
@@ -194,6 +194,39 @@ async def link_handler(m: Message):
     await download_queue.put((m.chat.id, user_id, m.text))
     await m.answer("📥 Добавлено в очередь...")
 
+async def get_remaining_downloads(user_id: int):
+    await reset_if_needed(user_id)
+    row = await get_user_row(user_id)
+
+    if not row:
+        return 0, 4
+
+    premium = row[2] or "обычный"
+    downloads_today = row[3] or 0
+
+    limit = LIMITS.get(premium, 4)
+
+    # безлимит
+    if limit is None:
+        return None, None
+
+    remaining = max(limit - downloads_today, 0)
+    return remaining, limit
+
+@dp.message(Command("limit"))
+async def show_limit(msg: Message):
+    remaining, limit = await get_remaining_downloads(msg.from_user.id)
+
+    if remaining is None:
+        await msg.answer("♾ У вас безлимитные скачивания сегодня.")
+        return
+
+    await msg.answer(
+        f"📊 Лимиты на сегодня:\n"
+        f"Всего: {limit}\n"
+        f"Осталось: {remaining}"
+    )
+    await bot.send_message(chat_id, f"📥 Осталось скачиваний сегодня: {remaining}")
 
 # ========= ADMIN COMMANDS =========
 @dp.message(Command("admin"))
