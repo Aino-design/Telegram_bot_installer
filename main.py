@@ -1,15 +1,15 @@
-# main.py — финальная исправленная версия
-# Исправления:
-# - TikTok photo-posts: строго парсим HTML / SIGI_STATE и скачиваем картинки (не запускаем yt-dlp)
-# - Pinterest: сначала пробуем yt-dlp (если это видео), только при неудаче — HTML-fallback
-# - Отправка изображений: отправляем до 10 фото как последовательность (media_group иногда проблемен в разных версиях aiogram)
-# - Ограничения: сохраняем и отправляем не больше 10 изображений
-# - Надёжные fallback'ы, не ломаем остальную логику (кнопка "Получить песню", БД, лимиты)
+# main.py — финальная версия: видео + отдельная команда для изображений (TikTok photo / Pinterest),
+# "Очки" (points) с фармингом каждые 20 часов, покупка премиума очками или звёздами,
+# /stats показывает количество премиум-пользователей и топ-10 по очкам.
+# Внимание: перед запуском убедитесь, что в requirements.txt есть:
+# aiogram, aiosqlite, yt-dlp, requests
+# И ffmpeg доступен в PATH (для извлечения аудио).
 import os
 import re
 import json
 import uuid
 import shutil
+import random
 import tempfile
 import logging
 import asyncio
@@ -28,50 +28,53 @@ from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 )
 
-# ---------- Настройки / лог ----------
+# -------------------- Настройки / лог --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТА"   # <- замените на реальный токен
+TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТА"   # <- замените
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
-# премиум настройки
-GOLD_PRICE = int(os.getenv("GOLD_PRICE") or 120)
+# премиум / цены (с использованием тех же чисел что и раньше)
+GOLD_PRICE = int(os.getenv("GOLD_PRICE") or 120)      # цена в звёздах или очках
 GOLD_DAYS = int(os.getenv("GOLD_DAYS") or 30)
 DIAMOND_PRICE = int(os.getenv("DIAMOND_PRICE") or 250)
 DIAMOND_DAYS = int(os.getenv("DIAMOND_DAYS") or 90)
 LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
+# TTL временных файлов
 AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS") or 30 * 60)
 
-# cookies.txt (опционально)
+# cookies.txt
 COOKIES_FILE = os.path.join(os.getcwd(), "cookies.txt")
 USE_COOKIES = os.path.exists(COOKIES_FILE)
 
-# бот и очередь
 bot = Bot(TOKEN)
 dp = Dispatcher()
 download_queue: asyncio.Queue = asyncio.Queue()
 
-# кеш: token -> {"audio": path|null, "tmpdir": tmpdir, "video": filename, "url": original_url, "owner": user_id}
+# кеш для аудио
 audio_cache: Dict[str, Dict[str, Optional[Any]]] = {}
 
-# расширения
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".m4v")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
 
-# ---------- БД ----------
+# -------------------- БД: init и помощники --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # добавляем колонки points (очки), image_mode (флаг ожидания изображений), last_farm (для cooldown)
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY,
             premium TEXT DEFAULT 'обычный',
             stars INTEGER DEFAULT 0,
+            points INTEGER DEFAULT 0,
             downloads INTEGER DEFAULT 0,
             reset TEXT,
-            expires TEXT
+            expires TEXT,
+            image_mode INTEGER DEFAULT 0,
+            last_farm TEXT
         )""")
         await db.commit()
     logger.info("DB initialized")
@@ -79,12 +82,12 @@ async def init_db():
 async def add_user(uid: int):
     now_iso = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users(id, reset) VALUES(?, ?)", (uid, now_iso))
+        await db.execute("INSERT OR IGNORE INTO users(id, reset, image_mode) VALUES(?, ?, 0)", (uid, now_iso))
         await db.commit()
 
 async def get_user(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, premium, stars, downloads, reset, expires FROM users WHERE id=?", (uid,)) as cur:
+        async with db.execute("SELECT id, premium, stars, points, downloads, reset, expires, image_mode, last_farm FROM users WHERE id=?", (uid,)) as cur:
             return await cur.fetchone()
 
 async def set_premium(uid: int, level: str, days: int):
@@ -98,12 +101,51 @@ async def add_stars(uid: int, amount: int):
         await db.execute("UPDATE users SET stars=stars+? WHERE id=?", (amount, uid))
         await db.commit()
 
+async def add_points(uid: int, amount: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET points=points+? WHERE id=?", (amount, uid))
+        await db.commit()
+
+async def use_points(uid: int, amount: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT points FROM users WHERE id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        if (row[0] or 0) < amount:
+            return False
+        await db.execute("UPDATE users SET points=points-? WHERE id=?", (amount, uid))
+        await db.commit()
+    return True
+
+async def use_stars(uid: int, amount: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT stars FROM users WHERE id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        if (row[0] or 0) < amount:
+            return False
+        await db.execute("UPDATE users SET stars=stars-? WHERE id=?", (amount, uid))
+        await db.commit()
+    return True
+
 async def increment_download(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
         await db.commit()
 
-# ---------- Сброс лимитов и проверки ----------
+async def set_image_mode(uid: int, mode: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET image_mode=? WHERE id=?", (mode, uid))
+        await db.commit()
+
+async def set_last_farm(uid: int, iso_ts: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET last_farm=? WHERE id=?", (iso_ts, uid))
+        await db.commit()
+
+# лимиты
 async def reset_if_needed(user_id: int):
     if not isinstance(user_id, int):
         return
@@ -130,7 +172,7 @@ async def can_download(uid: int) -> bool:
     user = await get_user(uid)
     if not user:
         return True
-    premium, downloads = user[1], user[3]
+    premium, downloads = user[1], user[4]
     limit = LIMITS.get(premium, 4)
     if limit is None:
         return True
@@ -144,14 +186,14 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
     if not user:
         return 4, 4, "обычный"
     premium = user[1] or "обычный"
-    downloads_today = user[3] or 0
+    downloads_today = user[4] or 0
     limit = LIMITS.get(premium, 4)
     if limit is None:
         return None, None, premium
     remaining = max(limit - downloads_today, 0)
     return remaining, limit, premium
 
-# ---------- Вспомогательные для web ----------
+# -------------------- Вспомогательные функции для веба --------------------
 def resolve_redirect(url: str, timeout: int = 10) -> str:
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout, allow_redirects=True)
@@ -171,14 +213,13 @@ def sanitize_tiktok_photo_url(url: str) -> str:
 
 def find_image_urls_from_html(html: str) -> List[str]:
     urls = []
-    # common direct image urls
     for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)', html, flags=re.IGNORECASE):
         urls.append(m.group(0))
-    # look for JSON-like image fields
-    for key in ('displayUrl', 'originCover', 'cover', 'downloadAddr', 'originImage', 'poster'):
+    # JSON-like search
+    for key in ('displayUrl','originCover','cover','downloadAddr','originImage','poster','og:image'):
         for m in re.finditer(rf'"{key}"\s*:\s*"(https?://[^"]+)"', html, flags=re.IGNORECASE):
             urls.append(m.group(1))
-    # og:image
+    # OG meta fallback
     m = re.search(r'<meta property="og:image" content="([^"]+)"', html)
     if m:
         urls.append(m.group(1))
@@ -211,26 +252,21 @@ def fetch_and_save_images_page(url: str, folder: str, limit: int = 10) -> List[s
     except Exception as e:
         logger.debug("fetch page failed %s", e)
         return saved
-
     img_urls = find_image_urls_from_html(html)
-
-    # Try to extract JSON in <script id="SIGI_STATE"> — TikTok mobile often stores data there
+    # Try extracting TikTok SIGI_STATE JSON block for more images
     if not img_urls:
         m = re.search(r'<script[^>]*id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>', html, flags=re.DOTALL | re.IGNORECASE)
         if m:
             try:
                 payload = m.group(1).strip()
                 j = json.loads(payload)
-                # collect any strings that look like image urls from JSON text
                 text = json.dumps(j)
                 found = re.findall(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)', text)
                 for u in found:
                     img_urls.append(u)
             except Exception:
                 pass
-
-    img_urls = list(dict.fromkeys(img_urls))  # dedupe preserve order
-
+    img_urls = list(dict.fromkeys(img_urls))  # dedupe keep order
     for i, img_url in enumerate(img_urls[:limit], start=1):
         if img_url.startswith("//"):
             img_url = "https:" + img_url
@@ -243,7 +279,7 @@ def fetch_and_save_images_page(url: str, folder: str, limit: int = 10) -> List[s
             saved.append(dest)
     return saved
 
-# ---------- yt-dlp functions ----------
+# -------------------- yt-dlp core + safe wrapper --------------------
 def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None) -> str:
     outtmpl = os.path.join(folder, "%(id)s.%(ext)s")
     ydl_opts = {
@@ -261,7 +297,6 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
         ydl_opts["cookiefile"] = cookiefile
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # prepare filename robustly
         try:
             filename = ydl.prepare_filename(info)
             if not os.path.exists(filename):
@@ -279,19 +314,12 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
         return filename
 
 def safe_download_video(url: str, folder: str) -> None:
-    """
-    Универсальная загрузка:
-    - TikTok photo: сразу парсим HTML/SIGI_STATE и скачиваем до 10 изображений
-    - Pinterest: пытаем yt-dlp первым, при ошибке — HTML-fallback (до 10 изображений)
-    - Остальные — yt-dlp с fallback HTML
-    """
     logger.info("safe_download_video start url=%s", url)
-
-    # Normalize short redirects
+    # Resolve redirects for short urls
     if any(s in url for s in ("vm.tiktok.com", "vt.tiktok.com", "https://vm.", "https://vt.")):
         url = resolve_redirect(url)
 
-    # --- TikTok photo handling (do not call yt-dlp) ---
+    # --- TikTok photo: DO NOT call yt-dlp; parse HTML and save up to 10 images ---
     if "tiktok.com" in url and "/photo/" in url:
         logger.info("Detected TikTok photo post — parsing page for images")
         url = sanitize_tiktok_photo_url(url)
@@ -299,30 +327,23 @@ def safe_download_video(url: str, folder: str) -> None:
         if saved:
             logger.info("TikTok photos saved count=%d", len(saved))
             return
-
-        # Try extracting from SIGI_STATE or other JSON in HTML
+        # try SIGI_STATE extractions
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
             html = r.text
-            # SIGI_STATE
             m = re.search(r'<script[^>]*id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>', html, flags=re.DOTALL | re.IGNORECASE)
             found_urls = []
             if m:
                 try:
                     payload = m.group(1).strip()
                     j = json.loads(payload)
-                    # stringify and extract URLs
                     text = json.dumps(j)
                     found_urls = re.findall(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)', text)
                 except Exception:
                     found_urls = []
-            # fallback regex extractions
             if not found_urls:
                 found_urls = re.findall(r'"displayUrl"\s*:\s*"(https?://[^"]+)"', html) + \
-                             re.findall(r'"originCover"\s*:\s*"(https?://[^"]+)"', html) + \
-                             re.findall(r'"cover"\s*:\s*"(https?://[^"]+)"', html) + \
-                             re.findall(r'"downloadAddr"\s*:\s*"(https?://[^"]+)"', html)
-            # sanitize and download up to 10
+                             re.findall(r'"originCover"\s*:\s*"(https?://[^"]+)"', html)
             cleaned = []
             for u in found_urls:
                 uu = u.replace('\\u002F', '/').replace('\\/', '/').replace('\\', '')
@@ -341,14 +362,12 @@ def safe_download_video(url: str, folder: str) -> None:
                 return
         except Exception:
             pass
-
         raise Exception("Не удалось найти/скачать фото TikTok (формат страницы нестандартный)")
 
-    # --- Pinterest: try yt-dlp first (often pins are videos) ---
+    # --- Pinterest: try ytdlp first (pins can be videos), else HTML images ---
     if "pinterest" in url or "pin.it" in url:
         try:
             filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
-            # if yt-dlp downloaded something, return (file can be video or image file)
             logger.info("Pinterest downloaded by yt-dlp: %s", filename)
             return
         except Exception as e:
@@ -359,7 +378,7 @@ def safe_download_video(url: str, folder: str) -> None:
                 return
             raise
 
-    # --- Main: try yt-dlp, fallback to HTML images ---
+    # --- General: try ytdlp then fallback to HTML images ---
     try:
         filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
         logger.info("yt-dlp downloaded: %s", filename)
@@ -372,7 +391,7 @@ def safe_download_video(url: str, folder: str) -> None:
             return
         raise
 
-# ---------- ffmpeg извлечение аудио ----------
+# -------------------- ffmpeg audio extraction --------------------
 async def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -401,10 +420,10 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         if tmpdir and os.path.exists(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
-        logger.exception("cleanup_audio_after_delay failed for token %s", token)
+        logger.exception("cleanup_audio_after_delay failed")
     audio_cache.pop(token, None)
 
-# ---------- Download worker ----------
+# -------------------- Download worker --------------------
 async def download_worker():
     while True:
         chat_id, user_id, url = await download_queue.get()
@@ -412,33 +431,31 @@ async def download_worker():
         token: Optional[str] = None
         try:
             await bot.send_message(chat_id, "⏳ Скачиваю...")
-            # запускаем safe_download_video в executor
+            # выполняем безопасную загрузку в executor
             await asyncio.get_event_loop().run_in_executor(None, partial(safe_download_video, url, tmp))
 
-            # Найдём видео/изображения в папке
+            # найти видео/изображения
             video_path: Optional[str] = None
             image_paths: List[str] = []
-
             for f in os.listdir(tmp):
                 if f.lower().endswith(VIDEO_EXTS):
                     video_path = os.path.join(tmp, f)
                     break
-
             if not video_path:
                 for f in os.listdir(tmp):
                     if f.lower().endswith(IMAGE_EXTS):
                         image_paths.append(os.path.join(tmp, f))
 
-            # Если есть изображения — отправляем (до 10), по одному (media_group иногда ведёт себя по-разному на разных версиях)
+            # если изображения (и не видео) — отправляем (до 10)
             if image_paths and not video_path:
                 try:
                     images_to_send = sorted(image_paths)[:10]
-                    # Отправляем как media_group если поддерживается: попробуем сначала media_group с FSInputFile.
+                    # Попытка отправить media_group
                     try:
                         media = [types.InputMediaPhoto(media=FSInputFile(path)) for path in images_to_send]
                         await bot.send_media_group(chat_id, media=media)
                     except Exception:
-                        # fallback: отправляем по очереди
+                        # fallback: отправка по одному
                         for path in images_to_send:
                             await bot.send_photo(chat_id, FSInputFile(path))
                     await bot.send_message(chat_id, f"✅ Готово! (изображения: {len(images_to_send)})")
@@ -450,11 +467,10 @@ async def download_worker():
                     logger.exception("send images failed: %s", e)
                     await bot.send_message(chat_id, f"❌ Ошибка отправки изображений: {e}")
                 finally:
-                    # очищаем tmp
                     shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # Если найдено видео — отправляем видео
+            # если видео — отправляем + кладём в кеш для получения аудио
             if video_path:
                 token = uuid.uuid4().hex
                 kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -492,11 +508,10 @@ async def download_worker():
                     "url": url,
                     "owner": user_id
                 }
-                # Планируем удаление tmp через TTL (если пользователь не запросит аудио)
                 asyncio.create_task(cleanup_audio_after_delay(token, AUDIO_TTL_SECONDS))
                 continue
 
-            # Ничего не найдено
+            # ничего не найдено
             await bot.send_message(chat_id, "❌ Не удалось скачать видео/изображения с этой ссылки.")
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -511,7 +526,7 @@ async def download_worker():
             except Exception:
                 pass
 
-# ---------- Callback: получение аудио ----------
+# -------------------- Callback: получение аудио --------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("get_audio:"))
 async def cb_get_audio(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
@@ -519,7 +534,6 @@ async def cb_get_audio(cq: CallbackQuery):
     if not info:
         await cq.answer("⚠️ Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
         return
-
     owner = info.get("owner")
     if owner and cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
         await cq.answer("Только тот, кто запросил видео, может получить аудио.", show_alert=True)
@@ -532,7 +546,6 @@ async def cb_get_audio(cq: CallbackQuery):
 
     await cq.answer()
 
-    # 1) если mp3 уже есть — отправляем
     if audio_path and os.path.exists(audio_path):
         try:
             await bot.send_chat_action(cq.from_user.id, "upload_audio")
@@ -550,7 +563,6 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
         return
 
-    # 2) если есть видео — извлечём через ffmpeg
     if video_path and os.path.exists(video_path):
         audio_path_new = os.path.join(tmpdir, "audio.mp3")
         await bot.send_chat_action(cq.from_user.id, "record_audio")
@@ -579,7 +591,6 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
         return
 
-    # 3) пробуем переполучить видео
     if url:
         new_tmp = tempfile.mkdtemp()
         try:
@@ -616,19 +627,193 @@ async def cb_get_audio(cq: CallbackQuery):
     await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
     audio_cache.pop(token, None)
 
-# ---------- Команды ----------
+# -------------------- Команды: базовые --------------------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await add_user(m.from_user.id)
-    info = "Отправь ссылку на TikTok, Instagram, YouTube, Pinterest — бот скачает видео/изображения."
+    info = "🔥TikGram_bot\n\nОтправь ссылку на видео (YouTube, TikTok, Pinterest и т. д.) — бот скачает видео.\n" \
+           "Если хочешь скачивать ИЗОБРАЖЕНИЯ (TikTok photo / Pinterest), сперва введи команду /images, " \
+           "а затем отправь ссылку на изображение. Иначе бот предложит сначала использовать /images."
     if USE_COOKIES:
-        info += "\n(Используется cookies.txt для авторизации пинов)"
-    await m.answer("🔥TikGram_bot\n\n" + info)
+        info += "\n(Используется cookies.txt для авторизованных пинов)"
+    await m.answer(info)
 
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
     await add_user(m.from_user.id)
-    await m.answer("🔥TikGram_bot\n\nОтправь ссылку на TikTok,Instagram,YouTube,Pinterest и бот скачает видео/изображения.")
+    await m.answer("🔥TikGram_bot\n\n/convert — отправьте ссылку на видео\n/images — режим для отправки ссылок на изображения (TikTok photo, Pinterest)\n/farm — фарм очков (раз в 20 часов)\n/stats — статистика и топ по очкам")
+
+@dp.message(Command("about"))
+async def about_handler(m: Message):
+    info = "🤖 Бот скачивает видео и изображения (отдельный режим). Может вырезать аудио из видео.\n" \
+           "Платежи: звёзды ⭐ и очки (points)."
+    await m.answer(info)
+
+@dp.message(Command("convert"))
+async def cmd_convert(m: Message):
+    await add_user(m.from_user.id)
+    await m.answer("🔗 Отправьте ссылку на видео и я обработаю его и пришлю вам!")
+
+# -------------------- Команда /images (включить режим изображений) --------------------
+@dp.message(Command("images"))
+async def images_mode_on(m: Message):
+    await add_user(m.from_user.id)
+    await set_image_mode(m.from_user.id, 1)
+    await m.answer("🖼 Режим изображений включён. Теперь пришлите ссылку на TikTok photo или Pinterest (одно сообщение). После обработки режим выключится автоматически.")
+
+# -------------------- Команды для покупки премиума очками или звёздами --------------------
+@dp.message(Command("buy_gold_points"))
+async def buy_gold_points(m: Message):
+    await add_user(m.from_user.id)
+    uid = m.from_user.id
+    ok = await use_points(uid, GOLD_PRICE)
+    if ok:
+        await set_premium(uid, "золотой", GOLD_DAYS)
+        await m.answer(f"✅ Вы купили Золотой премиум за {GOLD_PRICE} очков на {GOLD_DAYS} дней.")
+    else:
+        await m.answer(f"❌ У вас недостаточно очков. Цена: {GOLD_PRICE} очков.")
+
+@dp.message(Command("buy_diamond_points"))
+async def buy_diamond_points(m: Message):
+    await add_user(m.from_user.id)
+    uid = m.from_user.id
+    ok = await use_points(uid, DIAMOND_PRICE)
+    if ok:
+        await set_premium(uid, "алмазный", DIAMOND_DAYS)
+        await m.answer(f"✅ Вы купили Алмазный премиум за {DIAMOND_PRICE} очков на {DIAMOND_DAYS} дней.")
+    else:
+        await m.answer(f"❌ У вас недостаточно очков. Цена: {DIAMOND_PRICE} очков.")
+
+@dp.message(Command("buy_gold_stars"))
+async def buy_gold_stars(m: Message):
+    await add_user(m.from_user.id)
+    uid = m.from_user.id
+    ok = await use_stars(uid, GOLD_PRICE)
+    if ok:
+        await set_premium(uid, "золотой", GOLD_DAYS)
+        await m.answer(f"✅ Вы купили Золотой премиум за {GOLD_PRICE}⭐ на {GOLD_DAYS} дней.")
+    else:
+        await m.answer(f"❌ У вас недостаточно звёзд. Цена: {GOLD_PRICE}⭐.")
+
+@dp.message(Command("buy_diamond_stars"))
+async def buy_diamond_stars(m: Message):
+    await add_user(m.from_user.id)
+    uid = m.from_user.id
+    ok = await use_stars(uid, DIAMOND_PRICE)
+    if ok:
+        await set_premium(uid, "алмазный", DIAMOND_DAYS)
+        await m.answer(f"✅ Вы купили Алмазный премиум за {DIAMOND_PRICE}⭐ на {DIAMOND_DAYS} дней.")
+    else:
+        await m.answer(f"❌ У вас недостаточно звёзд. Цена: {DIAMOND_PRICE}⭐.")
+
+# -------------------- Фарм очков (каждые 20 часов) --------------------
+@dp.message(Command("farm"))
+async def farm_points(m: Message):
+    await add_user(m.from_user.id)
+    uid = m.from_user.id
+    user = await get_user(uid)
+    last_farm_iso = user[8] if user else None
+    now = datetime.now(timezone.utc)
+    if last_farm_iso:
+        try:
+            last = datetime.fromisoformat(last_farm_iso)
+        except Exception:
+            last = datetime.fromtimestamp(0, timezone.utc)
+        delta = now - last
+        if delta < timedelta(hours=20):
+            remain = timedelta(hours=20) - delta
+            hours = int(remain.total_seconds() // 3600)
+            minutes = int((remain.total_seconds() % 3600) // 60)
+            await m.answer(f"⏳ Вы уже фармили. Можно снова через {hours}ч {minutes}м.")
+            return
+    # give random 10-35
+    amount = random.randint(10, 35)
+    await add_points(uid, amount)
+    await set_last_farm(uid, now.isoformat())
+    await m.answer(f"🎉 Вы получили {amount} очков! (Можно фармить снова через 20 часов)")
+
+# -------------------- Команда /stats — premium count + top-10 by points --------------------
+@dp.message(Command("stats"))
+async def stats_handler(m: Message):
+    await add_user(m.from_user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        # premium counts
+        async with db.execute("SELECT premium, COUNT(*) FROM users GROUP BY premium") as cur:
+            rows = await cur.fetchall()
+        premium_counts = {r[0]: r[1] for r in rows}
+        total_premium = sum(v for k,v in premium_counts.items() if k in ("золотой", "алмазный"))
+        # top-10 by points
+        async with db.execute("SELECT id, points, stars FROM users ORDER BY points DESC LIMIT 10") as cur:
+            top = await cur.fetchall()
+    text = f"📊 Статистика\nВсего премиум-пользователей (золотой/алмазный): {total_premium}\n\n🏆 Топ-10 по очкам:\n"
+    if not top:
+        text += "Пока нет игроков."
+    else:
+        for i, row in enumerate(top, start=1):
+            uid, pts, stars = row
+            text += f"{i}. {uid} — {pts} очков, {stars or 0}⭐\n"
+    await m.answer(text)
+
+# -------------------- Обработка входящих ссылок --------------------
+@dp.message(F.text.startswith("http"))
+async def link_handler(m: Message):
+    user_id = m.from_user.id
+    url = m.text.strip()
+    await add_user(user_id)
+
+    # check if link looks like image-only (TikTok photo or Pinterest pin)
+    is_tiktok_photo = ("tiktok.com" in url and "/photo/" in url) or ("/photo/" in url and "tiktok" in url)
+    is_pinterest = "pinterest" in url or "pin.it" in url
+
+    # check user's image_mode
+    user = await get_user(user_id)
+    image_mode = user[7] if user else 0
+
+    # If link is image-type but user hasn't activated /images, instruct them
+    if (is_tiktok_photo or is_pinterest) and not image_mode:
+        await m.answer("🖼 Похоже, это ссылка на изображение (TikTok photo или Pinterest). Чтобы скачивать изображения, сперва введите команду /images и затем отправьте ссылку. Если вы хотите скачать видео — пришлите ссылку на видео.")
+        return
+
+    # If image_mode active — handle as image (and then reset image_mode to 0)
+    if image_mode:
+        await set_image_mode(user_id, 0)  # one-shot mode
+        # Process in executor: safe_download_video handles image pages and videos.
+        await download_queue.put((m.chat.id, user_id, url))
+        await m.answer("📥 Добавлено в очередь на скачивание изображения/видео... (режим изображений).")
+        return
+
+    # Normal video flow
+    if not await can_download(user_id):
+        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
+        return
+    await download_queue.put((m.chat.id, user_id, url))
+    await m.answer("📥 Добавлено в очередь...")
+
+# -------------------- Админ и покупка (старые команды) --------------------
+@dp.message(Command("buy_gold"))
+async def buy_gold_invoice(m: Message):
+    prices = [LabeledPrice(label=f"Золотой ({GOLD_DAYS} дней)", amount=GOLD_PRICE)]
+    # provider_token пустой — если у вас есть провайдер, заполните
+    try:
+        await bot.send_invoice(m.chat.id, title="Золотой премиум", description="Покупка премиума",
+                               payload=f"gold:{m.from_user.id}", provider_token="", currency="XTR", prices=prices,
+                               start_parameter="premium")
+    except Exception:
+        await m.answer("⚠️ Оплата через invoice не настроена на этом сервере. Используйте /buy_gold_stars или /buy_gold_points.")
+
+@dp.message(Command("buy_diamond"))
+async def buy_diamond_invoice(m: Message):
+    prices = [LabeledPrice(label=f"Алмазный ({DIAMOND_DAYS} дней)", amount=DIAMOND_PRICE)]
+    try:
+        await bot.send_invoice(m.chat.id, title="Алмазный премиум", description="Покупка премиума",
+                               payload=f"diamond:{m.from_user.id}", provider_token="", currency="XTR", prices=prices,
+                               start_parameter="premium")
+    except Exception:
+        await m.answer("⚠️ Оплата через invoice не настроена на этом сервере. Используйте /buy_diamond_stars или /buy_diamond_points.")
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(q.id, ok=True)
 
 @dp.message(Command("profile"))
 async def profile_handler(m: Message):
@@ -636,57 +821,25 @@ async def profile_handler(m: Message):
     if not user:
         await m.answer("👤 Профиль: не найден")
         return
-    await m.answer(f"👤 Профиль\n💎 {user[1]}\n⭐ Звёзды: {user[2]}\n")
-
-@dp.message(Command("premium"))
-async def premium_handler(m: Message):
     await m.answer(
-        f"💎 Премиум:\nОбычный — 4 видео в день\n🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\nКоманды: /buy_gold /buy_diamond"
+        f"👤 Профиль\n"
+        f"💎 {user[1]}\n"
+        f"⭐ Звёзды: {user[2]}\n"
+        f"🔹 Очки: {user[3]}\n"
     )
 
-@dp.message(Command("about"))
-async def about_handler(m: Message):
-    info = "🤖 Бот скачивает видео и изображения, может вырезать аудио.\nПоддерживается: TikTok (видео и photo-posts), YouTube, Pinterest, Instagram."
-    if USE_COOKIES:
-        info += "\nИспользуется cookies.txt для авторизации приватного контента."
-    await m.answer(info)
-
-@dp.message(Command("convert"))
-async def cmd_convert(m: Message):
-    await add_user(m.from_user.id)
-    await m.answer("🔗 Отправьте ссылку на видео/пин и я обработаю его и пришлю вам!")
-
-@dp.message(F.text.startswith("http"))
-async def link_handler(m: Message):
-    user_id = m.from_user.id
-    url = m.text.strip()
-    await add_user(user_id)
-    if not await can_download(user_id):
-        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
-        return
-    await download_queue.put((m.chat.id, user_id, url))
-    await m.answer("📥 Добавлено в очередь...")
-
-@dp.message(Command("limit"))
-async def limit_handler(m: Message):
-    await add_user(m.from_user.id)
-    try:
-        remaining, limit, premium = await get_remaining_downloads(m.from_user.id)
-    except Exception as e:
-        await m.answer(f"Ошибка при получении лимита: {e}")
-        return
-    if limit is None:
-        text = f"♾ У вас безлимитный тариф\n💎 Статус: {premium}"
-    else:
-        text = f"📊 Ваш лимит на сегодня:\n💎 Статус: {premium}\n⬇️ Осталось скачиваний: {remaining}/{limit}"
-    await m.answer(text)
-
-# ---------- Админ команды ----------
+# -------------------- Админ команды --------------------
 @dp.message(Command("admin"))
 async def admin_handler(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
-    await m.answer("/stats\n/give_gold ID\n/give_diamond ID\n/add_stars ID сумма")
+    await m.answer(
+        "🛠 Админ панель:\n"
+        "/stats — Статистика и топ\n"
+        "/give_gold ID — Выдать Золотой\n"
+        "/give_diamond ID — Выдать Алмазный\n"
+        "/add_stars ID сумма — Начислить звёзды\n/give_points ID сумма — Выдать очки"
+    )
 
 @dp.message(F.text.startswith("/give_gold"))
 async def give_gold(m: Message):
@@ -722,7 +875,19 @@ async def add_stars_handler(m: Message):
     except Exception:
         await m.answer("❌ Неверный формат. /add_stars ID сумма")
 
-# ---------- Запуск ----------
+@dp.message(F.text.startswith("/give_points"))
+async def give_points_handler(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = m.text.split()
+        uid = int(parts[1]); amount = int(parts[2])
+        await add_points(uid, amount)
+        await m.answer(f"✅ Начислено {amount} очков пользователю {uid}")
+    except Exception:
+        await m.answer("❌ Неверный формат. /give_points ID сумма")
+
+# -------------------- Запуск --------------------
 async def main():
     await init_db()
     try:
