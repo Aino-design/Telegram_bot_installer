@@ -106,15 +106,19 @@ async def can_download(uid: int) -> bool:
     return downloads < limit
 
 async def get_remaining_downloads(user_id: int):
+    # получаем пользователя
     row = await get_user(user_id)
+
+    # если пользователя нет — считаем обычным
     if not row:
-        return 4, 4, "обычный"  # downloads, limit, premium
+        return 4, 4, "обычный"  # remaining, limit, premium
 
-    premium = row[1] or "обычный"
-    downloads_today = row[3] or 0
-    limit = LIMITS.get(premium, 4)
+    premium = row[1] or "обычный"   # статус премиума
+    downloads_today = row[3] or 0   # сколько сегодня скачали
+    limit = LIMITS.get(premium, 4)  # лимит по статусу
 
-    if limit is None:  # безлимит
+    # безлимитный тариф
+    if limit is None:
         return None, None, premium
 
     remaining = max(limit - downloads_today, 0)
@@ -181,6 +185,7 @@ async def profile_handler(m: Message):
     user = await get_user(m.from_user.id)
     await m.answer(
         f"👤 Профиль\n"
+        f"💎 {user[1]}\n"
         f"💎 {user[1]}\n"
     )
 
