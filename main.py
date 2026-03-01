@@ -53,8 +53,8 @@ async def add_user(uid: int):
 
 async def get_user(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT * FROM users WHERE id=?", (uid,)) as c:
-            return await c.fetchone()
+        async with db.execute("SELECT id, premium, stars, downloads, reset, expires FROM users WHERE id=?", (uid,)) as cur:
+            return await cur.fetchone()
 
 
 async def set_premium(uid: int, level: str, days: int):
@@ -124,75 +124,79 @@ async def download_worker():
             shutil.rmtree(tmp)
 
 async def reset_if_needed(user_id: int):
-    user = await get_user(user_id)
-    if not user:
-        return
-    last_reset_str = user[4]  # поле reset
-    if last_reset_str:
-        last_reset = datetime.fromisoformat(last_reset_str)
+    if not isinstance(user_id, int):
+        return  # защита: если случайно пришло что-то не то — просто выйдем
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT reset FROM users WHERE id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
         now = datetime.utcnow()
+        if not row or row[0] is None:
+            # если нет записи о reset — запишем текущую дату
+            await db.execute("UPDATE users SET reset=? WHERE id=?", (now.isoformat(), user_id))
+            await db.commit()
+            return
+
+        try:
+            last_reset = datetime.fromisoformat(row[0])
+        except Exception:
+            # если формат некорректен — перепишем
+            await db.execute("UPDATE users SET reset=? WHERE id=?", (now.isoformat(), user_id))
+            await db.commit()
+            return
+
         if now.date() > last_reset.date():
-            # сбросить счётчик скачиваний
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET downloads=0, reset=? WHERE id=?", (now.isoformat(), user_id))
-                await db.commit()
+            await db.execute("UPDATE users SET downloads=0, reset=? WHERE id=?", (now.isoformat(), user_id))
+            await db.commit()
 
 
 # ========= limit options ======= #
-# ========= сброс лимита =========
-async def reset_if_needed(user_id: int):
-    user = await get_user(user_id)
-    if not user:
-        return
-    last_reset_str = user[4]  # поле reset
-    now = datetime.utcnow()
-    if last_reset_str:
-        last_reset = datetime.fromisoformat(last_reset_str)
-        if now.date() > last_reset.date():
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE users SET downloads=0, reset=? WHERE id=?",
-                    (now.isoformat(), user_id)
-                )
-                await db.commit()
-    else:
-        # если поля reset нет
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET reset=? WHERE id=?",
-                (now.isoformat(), user_id)
-            )
-            await db.commit()
 
 # ========= получение лимита =========
-async def get_remaining_downloads(user_id: int):
+async def get_remaining_downloads(user_id):
+    # защита от случайной передачи функции/объекта
+    if not isinstance(user_id, int):
+        raise TypeError(f"get_remaining_downloads expects int user_id, got {type(user_id)}")
+
     await reset_if_needed(user_id)
     user = await get_user(user_id)
-    # если пользователя нет в базе
+
     if not user:
-        return {"remaining": 4, "limit": 4, "premium": "обычный"}
+        # если пользователя нет — считаем как обычный
+        return 4, 4, "обычный"
 
     premium = user[1] or "обычный"
     downloads_today = user[3] or 0
     limit = LIMITS.get(premium, 4)
 
-    # безлимит
-    if limit is None:
-        return {"remaining": None, "limit": None, "premium": premium}
+    if limit is None:  # безлимитный тариф
+        return None, None, premium
 
     remaining = max(limit - downloads_today, 0)
-    return {"remaining": remaining, "limit": limit, "premium": premium}
+    return remaining, limit, premium
 
 # ========= команда /limit =========
 @dp.message(Command("limit"))
 async def limit_handler(m: Message):
+    # убедимся, что пользователь есть в базе
     await add_user(m.from_user.id)
-    remaining, limit, premium = await get_remaining_downloads(get_user)
+
+    user_id = m.from_user.id  # <- обязательно берем id именно из сообщения
+    try:
+        remaining, limit, premium = await get_remaining_downloads(user_id)
+    except Exception as e:
+        # на случай, если что-то пошло не так — вернём корректное сообщение, не падая
+        await m.answer(f"Ошибка при получении лимита: {e}")
+        return
 
     if limit is None:
         text = f"♾ У вас безлимитный тариф\n💎 Статус: {premium}"
     else:
-        text = f"⬇️ Осталось скачиваний: {remaining}/{limit}"
+        text = (
+            f"📊 Ваш лимит на сегодня:\n\n"
+            f"💎 Статус: {premium}\n"
+            f"⬇️ Осталось скачиваний: {remaining}/{limit}"
+        )
 
     await m.answer(text)
 
@@ -268,25 +272,6 @@ async def link_handler(m: Message):
         return
     await download_queue.put((m.chat.id, user_id, m.text))
     await m.answer("📥 Добавлено в очередь...")
-
-async def get_remaining_downloads(user_id: int):
-    await reset_if_needed(user_id)
-    row = await get_user(user_id)
-
-    if not row:
-        return 0, 4
-
-    premium = row[2] or "обычный"
-    downloads_today = row[3] or 0
-
-    limit = LIMITS.get(premium, 4)
-
-    # безлимит
-    if limit is None:
-        return None, None
-
-    remaining = max(limit - downloads_today, 0)
-    return remaining, limit
 
 # ========= ADMIN COMMANDS =========
 @dp.message(Command("admin"))
