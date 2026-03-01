@@ -149,6 +149,18 @@ async def profile_handler(m: Message):
         f"👤 Профиль\n"
         f"💎 {user[1]}\n"
     )
+    remaining, limit = await get_remaining_downloads(msg.from_user.id)
+
+    if remaining is None:
+        await msg.answer("♾ У вас безлимитные скачивания сегодня.")
+        return
+
+    await msg.answer(
+        f"📊 Лимиты на сегодня:\n"
+        f"Всего: {limit}\n"
+        f"Осталось: {remaining}"
+    )
+    await bot.send_message(chat_id, f"📥 Осталось скачиваний сегодня: {remaining}")
 
 
 @dp.message(Command("premium"))
@@ -212,21 +224,6 @@ async def get_remaining_downloads(user_id: int):
 
     remaining = max(limit - downloads_today, 0)
     return remaining, limit
-
-@dp.message(Command("limit"))
-async def show_limit(msg: Message):
-    remaining, limit = await get_remaining_downloads(msg.from_user.id)
-
-    if remaining is None:
-        await msg.answer("♾ У вас безлимитные скачивания сегодня.")
-        return
-
-    await msg.answer(
-        f"📊 Лимиты на сегодня:\n"
-        f"Всего: {limit}\n"
-        f"Осталось: {remaining}"
-    )
-    await bot.send_message(chat_id, f"📥 Осталось скачиваний сегодня: {remaining}")
 
 # ========= ADMIN COMMANDS =========
 @dp.message(Command("admin"))
