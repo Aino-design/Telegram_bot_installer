@@ -187,16 +187,12 @@ async def get_remaining_downloads(user_id: int):
 @dp.message(Command("limit"))
 async def limit_handler(m: Message):
     await add_user(m.from_user.id)
-    data = await get_remaining_downloads(m.from_user.id)
-
-    if data["limit"] is None:
-        text = f"♾ У вас безлимитный тариф\n💎 Статус: {data['premium']}"
+    remaining, limit, premium = await get_remaining_downloads(user_id)
+    
+    if limit is None:
+        text = f"♾ У вас безлимитный тариф\n💎 Статус: {premium}"
     else:
-        text = (
-            f"📊 Ваш лимит на сегодня:\n"
-            f"💎 Статус: {data['premium']}\n"
-            f"⬇️ Осталось скачиваний: {data['remaining']}/{data['limit']}"
-        )
+        text = f"⬇️ Осталось скачиваний: {remaining}/{limit}"
 
     await m.answer(text)
 
