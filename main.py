@@ -1,4 +1,4 @@
-# main.py — полностью готовый рабочий файл
+# main.py — с поддержкой Pinterest (pinterest.com)
 import asyncio
 import os
 import tempfile
@@ -6,12 +6,12 @@ import shutil
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import aiosqlite
 from yt_dlp import YoutubeDL
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, LabeledPrice, PreCheckoutQuery, FSInputFile,
@@ -22,7 +22,7 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТП"   # <- вставь реальный токен
+TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТА"   # <- вставь реальный токен
 ADMIN_ID = 6705555401
 DB_PATH = "bot_db.sqlite"
 
@@ -136,6 +136,7 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
 
 # ---------- yt-dlp скачивание ----------
 def download_video(url: str, folder: str):
+    # Поддерживает YouTube/TikTok/Instagram/Pinterest и другие через yt-dlp
     ydl_opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(folder, "video.%(ext)s"),
@@ -145,6 +146,12 @@ def download_video(url: str, folder: str):
         "noplaylist": True,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
+    # Для Pinterest иногда полезно разрешить скачивание изображений/видео напрямую
+    if "pinterest." in url:
+        ydl_opts.update({
+            "format": "best/bestvideo+bestaudio/best",
+            # иногда pinterest отдаёт изображения, так что разрешим разные форматы
+        })
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -180,30 +187,58 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         logger.exception("cleanup_audio_after_delay failed for token %s", token)
     audio_cache.pop(token, None)
 
-# ---------- Download worker (скачивает, отправляет видео + кнопку) ----------
+# ---------- Download worker (скачивает, отправляет видео/изображения + кнопка) ----------
 async def download_worker():
     while True:
         chat_id, user_id, url = await download_queue.get()
         tmp = tempfile.mkdtemp()
         token: Optional[str] = None
         try:
-            await bot.send_message(chat_id, "⏳ Скачиваю видео...")
+            await bot.send_message(chat_id, "⏳ Скачиваю...")
             # скачиваем (в блоке executor)
             await asyncio.get_event_loop().run_in_executor(None, download_video, url, tmp)
 
             # находим видео
             video_path: Optional[str] = None
+            images: List[str] = []
             for f in os.listdir(tmp):
                 if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
                     video_path = os.path.join(tmp, f)
                     break
+            # если видео не найдено — проверим изображения (Pinterest, снимки с Instagram и т.п.)
+            if not video_path:
+                for f in os.listdir(tmp):
+                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        images.append(f)
 
-            if not video_path or not os.path.exists(video_path):
-                await bot.send_message(chat_id, "❌ Не удалось найти скачанный файл.")
+            if not video_path and not images:
+                await bot.send_message(chat_id, "❌ Не удалось найти скачанный файл (видео или изображения).")
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # подготавливаем токен и клавиатуру
+            # Если найдено изображение(я) — отправляем их как альбом (до 10 штук)
+            if images and not video_path:
+                try:
+                    media = []
+                    images_sorted = sorted(images)[:10]
+                    for img in images_sorted:
+                        path = os.path.join(tmp, img)
+                        media.append(types.InputMediaPhoto(media=types.InputFile(path)))
+                    await bot.send_media_group(chat_id, media=media)
+                    await bot.send_message(chat_id, "✅ Готово! (изображения)")
+                    # увеличиваем счётчик скачиваний
+                    try:
+                        await increment_download(user_id)
+                    except Exception:
+                        logger.exception("increment_download failed for %s", user_id)
+                except Exception as e:
+                    logger.exception("send images failed: %s", e)
+                    await bot.send_message(chat_id, f"❌ Ошибка отправки изображений: {e}")
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                continue
+
+            # Подготавливаем токен и клавиатуру — только для видео
             token = uuid.uuid4().hex
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Получить песню 🎵", callback_data=f"get_audio:{token}")]
@@ -379,7 +414,7 @@ async def cmd_start(m: Message):
     await add_user(m.from_user.id)
     await m.answer(
         "🔥TikGram_installer_bot\n\n"
-        "Отправь ссылку на TikTok,Instagram,YouTube и бот скачает видео."
+        "Отправь ссылку на TikTok,Instagram,YouTube,Pinterest и бот скачает видео/изображения."
     )
 
 @dp.message(Command("menu"))
@@ -387,7 +422,7 @@ async def cmd_menu(m: Message):
     await add_user(m.from_user.id)
     await m.answer(
         "🔥TikGram_installer_bot\n\n"
-        "Отправь ссылку на TikTok,Instagram,YouTube и бот скачает видео."
+        "Отправь ссылку на TikTok,Instagram,YouTube,Pinterest и бот скачает видео/изображения."
     )
 
 @dp.message(Command("profile"))
@@ -415,7 +450,7 @@ async def premium_handler(m: Message):
 
 @dp.message(Command("about"))
 async def about_handler(m: Message):
-    await m.answer("🤖 Бот конвертирует ссылки в видео и может вырезать аудио из видео.")
+    await m.answer("🤖 Бот конвертирует ссылки в видео и может вырезать аудио из видео. Поддерживает Pinterest.")
 
 @dp.message(Command("buy_gold"))
 async def buy_gold(m: Message):
@@ -438,7 +473,7 @@ async def pre_checkout(q: PreCheckoutQuery):
 @dp.message(Command("convert"))
 async def cmd_convert(m: Message):
     await add_user(m.from_user.id)
-    await m.answer("🔗 Отправьте ссылку на видео и я обработаю его и пришлю вам!")
+    await m.answer("🔗 Отправьте ссылку на видео/пин и я обработаю его и пришлю вам!")
 
 @dp.message(F.text.startswith("http"))
 async def link_handler(m: Message):
