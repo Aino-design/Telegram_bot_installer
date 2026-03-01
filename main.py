@@ -265,52 +265,53 @@ async def cb_get_audio(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
     info = audio_cache.get(token)
 
-    # если информация отсутствует — просим пользователя отправить ссылку снова
+    # если нет записи — сообщаем
     if not info:
-        await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
+        await cq.answer("⚠️ Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
         return
 
-    # защита: только владелец или админ может запрашивать (опционально)
+    # опционально: только владелец может получить аудио (если нужно)
     owner = info.get("owner")
     if owner and cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
-        await cq.answer("Только пользователь, запросивший видео, может получить аудио.", show_alert=True)
+        await cq.answer("Только тот, кто запросил видео, может получить аудио.", show_alert=True)
         return
 
-    audio_path = info.get("audio")  # может быть None
-    tmpdir = info.get("tmpdir")
-    video_path = info.get("video")
-    url = info.get("url")
+    # подготовка путей/данных
+    audio_path = info.get("audio")      # может быть None
+    tmpdir = info.get("tmpdir")        # папка с файлами
+    video_path = info.get("video")     # путь к видео (если сохранили)
+    url = info.get("url")              # исходный url (на случай повторного скачивания)
 
-    # Если mp3 уже есть — просто отправляем
+    # закроем крутилку на кнопке
+    await cq.answer()
+
+    # 1) если mp3 уже есть в кеше — отправляем сразу как аудио (не voice)
     if audio_path and os.path.exists(audio_path):
         try:
-            await cq.answer()  # закрывает индикатор
             await bot.send_chat_action(cq.from_user.id, "upload_audio")
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path))
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path), title="Аудио из видео")
         except Exception:
             await cq.answer("Ошибка при отправке аудио.", show_alert=True)
         finally:
-            # почистим tmp и кеш
+            # чистим файлы и запись
             try:
                 if os.path.exists(audio_path):
                     os.remove(audio_path)
                 if tmpdir and os.path.exists(tmpdir):
                     shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
-                logger.exception("Cleanup after send audio failed")
+                pass
             audio_cache.pop(token, None)
         return
 
-    # Если mp3 ещё не создан, но видео-файл есть — создаём mp3
+    # 2) если mp3 нет, но есть видео-файл — извлекаем на месте и отправляем
     if video_path and os.path.exists(video_path):
-        # делаем путь для аудио
         audio_path_new = os.path.join(tmpdir, "audio.mp3")
-        await cq.answer()  # закроет индикатор
         await bot.send_chat_action(cq.from_user.id, "record_audio")
         success = await extract_audio_ffmpeg(video_path, audio_path_new)
         if not success:
             await cq.answer("Не удалось извлечь аудио из видео.", show_alert=True)
-            # опционально: удаляем tmp чтобы не лежал мусор
+            # удаляем кеш/временную папку, чтобы не оставлять мусор
             try:
                 if tmpdir and os.path.exists(tmpdir):
                     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -318,32 +319,28 @@ async def cb_get_audio(cq: CallbackQuery):
                 pass
             audio_cache.pop(token, None)
             return
-        # если получилось — отправляем
+        # отправляем как аудио (песня)
         try:
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new))
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new), title="Аудио из видео")
         except Exception:
             await cq.answer("Ошибка при отправке аудио.", show_alert=True)
-            # не обломаем — удаляем файлы
         finally:
-            # удаляем файлы и кеш
             try:
                 if os.path.exists(audio_path_new):
                     os.remove(audio_path_new)
                 if tmpdir and os.path.exists(tmpdir):
                     shutil.rmtree(tmpdir, ignore_errors=True)
             except Exception:
-                logger.exception("Cleanup after send audio failed")
+                pass
             audio_cache.pop(token, None)
         return
 
-    # Если ни видео ни mp3 нет (файлы удалены), пробуем перезагрузить — но без гарантии:
+    # 3) Если ни mp3 ни видео нет — пробуем повторно скачать (fallback), иначе — сообщаем
     if url:
-        # попробуем заново скачать в новый tmp и извлечь
         new_tmp = tempfile.mkdtemp()
         try:
-            await cq.answer("Аудио недоступно, заново скачиваю и извлекаю...", show_alert=True)
+            await cq.answer("Аудио отсутствует — пробую повторно скачать видео...", show_alert=True)
             await asyncio.get_event_loop().run_in_executor(None, download_video, url, new_tmp)
-            # найти видео
             new_video = None
             for f in os.listdir(new_tmp):
                 if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
@@ -361,9 +358,8 @@ async def cb_get_audio(cq: CallbackQuery):
                 shutil.rmtree(new_tmp, ignore_errors=True)
                 audio_cache.pop(token, None)
                 return
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new))
-        except Exception as e:
-            logger.exception("Re-download+extract failed: %s", e)
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new), title="Аудио из видео")
+        except Exception:
             await cq.answer("Ошибка при повторном скачивании/конвертации.", show_alert=True)
         finally:
             try:
@@ -373,7 +369,7 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
         return
 
-    # В остальных случаях сообщаем, что аудио недоступно
+    # В остальных случаях
     await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
     audio_cache.pop(token, None)
 
