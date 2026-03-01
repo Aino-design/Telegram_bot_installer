@@ -1,4 +1,4 @@
-# main.py — с поддержкой Pinterest (pinterest.com)
+# main.py — готовый рабочий файл с улучшенной поддержкой Pinterest и TikTok photo
 import asyncio
 import os
 import tempfile
@@ -33,7 +33,7 @@ DIAMOND_PRICE = 250
 DIAMOND_DAYS = 90
 LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
-# TTL для временных файлов — 30 минут (уменьшает шанс истечения раньше)
+# TTL для временных файлов — 30 минут
 AUDIO_TTL_SECONDS = 30 * 60  # 30 минут
 
 # бот и очередь
@@ -134,24 +134,37 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
     remaining = max(limit - downloads_today, 0)
     return remaining, limit, premium
 
-# ---------- yt-dlp скачивание ----------
+# ---------- yt-dlp скачивание (универсальный) ----------
 def download_video(url: str, folder: str):
-    # Поддерживает YouTube/TikTok/Instagram/Pinterest и другие через yt-dlp
+    """
+    Универсальные опции yt-dlp: не требовать mp4, разрешать неплейабельные форматы,
+    сохранять файлы под id (безопасно), поддерживать загрузку изображений и HLS.
+    """
     ydl_opts = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": os.path.join(folder, "video.%(ext)s"),
-        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "format": "best",  # важное: не требовать ext=mp4
         "quiet": True,
         "no_warnings": True,
+        "ignoreerrors": False,
         "noplaylist": True,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "allow_unplayable_formats": True,
+        # некоторые extractors могут отдавать несколько файлов — пусть yt-dlp сам их положит в папку
     }
-    # Для Pinterest иногда полезно разрешить скачивание изображений/видео напрямую
+
+    # Специально для TikTok photo ссылки: yt-dlp в новых версиях поддерживает их,
+    # но полезно разрешить незамедлительную загрузку всех форматов.
+    if "tiktok.com" in url and "/photo/" in url:
+        ydl_opts["format"] = "best"
+        ydl_opts["noplaylist"] = True
+        ydl_opts["allow_unplayable_formats"] = True
+
+    # Pinterest иногда даёт нестандартные форматы (HLS/JSON/images) — позволим yt-dlp взять лучший доступный.
     if "pinterest." in url:
-        ydl_opts.update({
-            "format": "best/bestvideo+bestaudio/best",
-            # иногда pinterest отдаёт изображения, так что разрешим разные форматы
-        })
+        ydl_opts["format"] = "best"
+        ydl_opts["allow_unplayable_formats"] = True
+
+    # Запускаем загрузку
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
@@ -187,7 +200,10 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         logger.exception("cleanup_audio_after_delay failed for token %s", token)
     audio_cache.pop(token, None)
 
-# ---------- Download worker (скачивает, отправляет видео/изображения + кнопка) ----------
+# ---------- Download worker (скачивает, отправляет видео/изображения + кнопку) ----------
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".m4v")
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
+
 async def download_worker():
     while True:
         chat_id, user_id, url = await download_queue.get()
@@ -198,32 +214,47 @@ async def download_worker():
             # скачиваем (в блоке executor)
             await asyncio.get_event_loop().run_in_executor(None, download_video, url, tmp)
 
-            # находим видео
+            # Найдём видео/изображения в папке
             video_path: Optional[str] = None
-            images: List[str] = []
+            image_paths: List[str] = []
+            other_files: List[str] = []
+
             for f in os.listdir(tmp):
-                if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
-                    video_path = os.path.join(tmp, f)
+                f_lower = f.lower()
+                full = os.path.join(tmp, f)
+                if f_lower.endswith(VIDEO_EXTS):
+                    video_path = full
+                    # не break — на всякий случай оставляем первыми найденными видео
                     break
-            # если видео не найдено — проверим изображения (Pinterest, снимки с Instagram и т.п.)
+
+            # если видео не найдено — соберём изображения
             if not video_path:
                 for f in os.listdir(tmp):
-                    if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                        images.append(f)
+                    f_lower = f.lower()
+                    full = os.path.join(tmp, f)
+                    if f_lower.endswith(IMAGE_EXTS):
+                        image_paths.append(full)
+                    else:
+                        other_files.append(full)
 
-            if not video_path and not images:
-                await bot.send_message(chat_id, "❌ Не удалось найти скачанный файл (видео или изображения).")
-                shutil.rmtree(tmp, ignore_errors=True)
-                continue
+            if not video_path and not image_paths:
+                # иногда yt-dlp сохраняет JSON/metadata и файл формата, который не имеет привычного расширения.
+                # попробуем найти любой файл с размером > 0 и с расширением (как fallback).
+                for f in os.listdir(tmp):
+                    full = os.path.join(tmp, f)
+                    if os.path.isfile(full) and os.path.getsize(full) > 0:
+                        # если файл не маленький и не текстовый metadata — считаем как потенциальное медиа
+                        # допустим, это может быть webm без расширения, но редко.
+                        other_files.append(full)
 
-            # Если найдено изображение(я) — отправляем их как альбом (до 10 штук)
-            if images and not video_path:
+            # Если нашлись изображения — отправим их как альбом
+            if image_paths and not video_path:
                 try:
+                    # Telegram ограничивает media_group до 10 элементов
+                    images_to_send = sorted(image_paths)[:10]
                     media = []
-                    images_sorted = sorted(images)[:10]
-                    for img in images_sorted:
-                        path = os.path.join(tmp, img)
-                        media.append(types.InputMediaPhoto(media=types.InputFile(path)))
+                    for img in images_to_send:
+                        media.append(types.InputMediaPhoto(media=types.InputFile(img)))
                     await bot.send_media_group(chat_id, media=media)
                     await bot.send_message(chat_id, "✅ Готово! (изображения)")
                     # увеличиваем счётчик скачиваний
@@ -238,49 +269,55 @@ async def download_worker():
                     shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # Подготавливаем токен и клавиатуру — только для видео
-            token = uuid.uuid4().hex
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Получить песню 🎵", callback_data=f"get_audio:{token}")]
-            ])
-            caption_text = "✅ Готово!\nХотите конвертировать только песню?"
+            # Если найдено видео — отправляем его и кладём в кеш для получения аудио
+            if video_path:
+                token = uuid.uuid4().hex
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Получить песню 🎵", callback_data=f"get_audio:{token}")]
+                ])
+                caption_text = "✅ Готово!\nХотите конвертировать только песню?"
 
-            # Отправляем видео (video или document)
-            sent_ok = False
-            try:
-                await bot.send_video(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
-                sent_ok = True
-            except Exception:
-                logger.exception("send_video failed; trying send_document")
+                sent_ok = False
                 try:
-                    await bot.send_document(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
+                    # Отправляем как video (если большой — aiogram сам разобрается)
+                    await bot.send_video(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
                     sent_ok = True
-                except Exception as e_send:
-                    logger.exception("send_document failed: %s", e_send)
-                    await bot.send_message(chat_id, f"❌ Ошибка отправки видео: {e_send}")
-                    sent_ok = False
+                except Exception:
+                    logger.exception("send_video failed; trying send_document")
+                    try:
+                        await bot.send_document(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
+                        sent_ok = True
+                    except Exception as e_send:
+                        logger.exception("send_document failed: %s", e_send)
+                        await bot.send_message(chat_id, f"❌ Ошибка отправки видео: {e_send}")
+                        sent_ok = False
 
-            if not sent_ok:
-                shutil.rmtree(tmp, ignore_errors=True)
+                if not sent_ok:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    continue
+
+                # увеличиваем счётчик скачиваний
+                try:
+                    await increment_download(user_id)
+                except Exception:
+                    logger.exception("increment_download failed for %s", user_id)
+
+                # кладём в кеш метаданные (audio=None пока)
+                audio_cache[token] = {
+                    "audio": None,
+                    "tmpdir": tmp,
+                    "video": video_path,
+                    "url": url,
+                    "owner": user_id
+                }
+
+                # запланируем удаление tmp через TTL
+                asyncio.create_task(cleanup_audio_after_delay(token, AUDIO_TTL_SECONDS))
                 continue
 
-            # увеличиваем счётчик скачиваний
-            try:
-                await increment_download(user_id)
-            except Exception:
-                logger.exception("increment_download failed for %s", user_id)
-
-            # кладём в кеш метаданные (audio=None пока)
-            audio_cache[token] = {
-                "audio": None,
-                "tmpdir": tmp,
-                "video": video_path,
-                "url": url,
-                "owner": user_id
-            }
-
-            # запланируем удаление tmp через TTL
-            asyncio.create_task(cleanup_audio_after_delay(token, AUDIO_TTL_SECONDS))
+            # Если попали сюда — не нашли медиа
+            await bot.send_message(chat_id, "❌ Не удалось скачать видео/изображения с этой ссылки.")
+            shutil.rmtree(tmp, ignore_errors=True)
 
         except Exception as exc:
             logger.exception("download_worker exception: %s", exc)
@@ -292,7 +329,7 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
             except Exception:
                 pass
-        # не удаляем tmp здесь, т.к. он нужен для callback-аудио
+        # не удаляем tmp здесь, т.к. он нужен для callback-аудио (в случае видео)
 
 # ---------- Callback: обработка нажатия "Получить песню" ----------
 @dp.callback_query(lambda c: c.data and c.data.startswith("get_audio:"))
@@ -378,7 +415,7 @@ async def cb_get_audio(cq: CallbackQuery):
             await asyncio.get_event_loop().run_in_executor(None, download_video, url, new_tmp)
             new_video = None
             for f in os.listdir(new_tmp):
-                if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
+                if f.lower().endswith(VIDEO_EXTS):
                     new_video = os.path.join(new_tmp, f)
                     break
             if not new_video:
@@ -450,7 +487,7 @@ async def premium_handler(m: Message):
 
 @dp.message(Command("about"))
 async def about_handler(m: Message):
-    await m.answer("🤖 Бот конвертирует ссылки в видео и может вырезать аудио из видео. Поддерживает Pinterest.")
+    await m.answer("🤖 Бот конвертирует ссылки в видео и может вырезать аудио из видео. Поддерживает Pinterest и TikTok photo.")
 
 @dp.message(Command("buy_gold"))
 async def buy_gold(m: Message):
