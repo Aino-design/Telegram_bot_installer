@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import aiosqlite
 from yt_dlp import YoutubeDL
 
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, LabeledPrice, PreCheckoutQuery, FSInputFile
@@ -106,18 +107,16 @@ async def can_download(uid: int) -> bool:
     return downloads < limit
 
 async def get_remaining_downloads(user_id: int):
-    # получаем пользователя
-    row = await get_user(user_id)
+    await reset_if_needed(user_id)  # сначала сброс лимита, если нужен
+    user = await get_user(user_id)
 
-    # если пользователя нет — считаем обычным
-    if not row:
-        return 4, 4, "обычный"  # remaining, limit, premium
+    if not user:
+        return 4, 4, "обычный"
 
-    premium = row[1] or "обычный"   # статус премиума
-    downloads_today = row[3] or 0   # сколько сегодня скачали
-    limit = LIMITS.get(premium, 4)  # лимит по статусу
+    premium = user[1] or "обычный"
+    downloads_today = user[3] or 0
+    limit = LIMITS.get(premium, 4)
 
-    # безлимитный тариф
     if limit is None:
         return None, None, premium
 
@@ -159,6 +158,20 @@ async def download_worker():
             await bot.send_message(chat_id, f"❌ Ошибка: {e}")
         finally:
             shutil.rmtree(tmp)
+
+async def reset_if_needed(user_id: int):
+    user = await get_user(user_id)
+    if not user:
+        return
+    last_reset_str = user[4]  # поле reset
+    if last_reset_str:
+        last_reset = datetime.fromisoformat(last_reset_str)
+        now = datetime.utcnow()
+        if now.date() > last_reset.date():
+            # сбросить счётчик скачиваний
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET downloads=0, reset=? WHERE id=?", (now.isoformat(), user_id))
+                await db.commit()
 
 
 # ========= COMMANDS =========
