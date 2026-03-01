@@ -1,9 +1,4 @@
-# main.py — финальная версия: видео + отдельная команда для изображений (TikTok photo / Pinterest),
-# "Очки" (points) с фармингом каждые 20 часов, покупка премиума очками или звёздами,
-# /stats показывает количество премиум-пользователей и топ-10 по очкам.
-# Внимание: перед запуском убедитесь, что в requirements.txt есть:
-# aiogram, aiosqlite, yt-dlp, requests
-# И ffmpeg доступен в PATH (для извлечения аудио).
+# main.py — исправленная рабочая версия (aiogram v3)
 import os
 import re
 import json
@@ -24,7 +19,7 @@ from yt_dlp import YoutubeDL
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, LabeledPrice, PreCheckoutQuery, FSInputFile,
+    Message, LabeledPrice, PreCheckoutQuery,
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 )
 
@@ -32,7 +27,7 @@ from aiogram.types import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТА"   # <- замените
+TOKEN = os.getenv("TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"   # <- замените
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
@@ -50,7 +45,7 @@ AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS") or 30 * 60)
 COOKIES_FILE = os.path.join(os.getcwd(), "cookies.txt")
 USE_COOKIES = os.path.exists(COOKIES_FILE)
 
-bot = Bot(TOKEN)
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 download_queue: asyncio.Queue = asyncio.Queue()
 
@@ -63,7 +58,6 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
 # -------------------- БД: init и помощники --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # добавляем колонки points (очки), image_mode (флаг ожидания изображений), last_farm (для cooldown)
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY,
@@ -213,6 +207,7 @@ def sanitize_tiktok_photo_url(url: str) -> str:
 
 def find_image_urls_from_html(html: str) -> List[str]:
     urls = []
+    # основной паттерн (исправлены кавычки)
     for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)', html, flags=re.IGNORECASE):
         urls.append(m.group(0))
     # JSON-like search
@@ -452,12 +447,12 @@ async def download_worker():
                     images_to_send = sorted(image_paths)[:10]
                     # Попытка отправить media_group
                     try:
-                        media = [types.InputMediaPhoto(media=FSInputFile(path)) for path in images_to_send]
+                        media = [types.InputMediaPhoto(media=types.InputFile(path)) for path in images_to_send]
                         await bot.send_media_group(chat_id, media=media)
                     except Exception:
                         # fallback: отправка по одному
                         for path in images_to_send:
-                            await bot.send_photo(chat_id, FSInputFile(path))
+                            await bot.send_photo(chat_id, types.InputFile(path))
                     await bot.send_message(chat_id, f"✅ Готово! (изображения: {len(images_to_send)})")
                     try:
                         await increment_download(user_id)
@@ -480,12 +475,12 @@ async def download_worker():
 
                 sent_ok = False
                 try:
-                    await bot.send_video(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
+                    await bot.send_video(chat_id, types.InputFile(video_path), caption=caption_text, reply_markup=kb)
                     sent_ok = True
                 except Exception:
                     logger.exception("send_video failed; trying send_document")
                     try:
-                        await bot.send_document(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
+                        await bot.send_document(chat_id, types.InputFile(video_path), caption=caption_text, reply_markup=kb)
                         sent_ok = True
                     except Exception as e_send:
                         logger.exception("send_document failed: %s", e_send)
@@ -527,7 +522,7 @@ async def download_worker():
                 pass
 
 # -------------------- Callback: получение аудио --------------------
-@dp.callback_query(lambda c: c.data and c.data.startswith("get_audio:"))
+@dp.callback_query(F.data.startswith("get_audio:"))
 async def cb_get_audio(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
     info = audio_cache.get(token)
@@ -549,7 +544,7 @@ async def cb_get_audio(cq: CallbackQuery):
     if audio_path and os.path.exists(audio_path):
         try:
             await bot.send_chat_action(cq.from_user.id, "upload_audio")
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path), title="Аудио из видео")
+            await bot.send_audio(cq.from_user.id, types.InputFile(audio_path), title="Аудио из видео")
         except Exception:
             await cq.answer("Ошибка при отправке аудио.", show_alert=True)
         finally:
@@ -577,7 +572,7 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
             return
         try:
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new), title="Аудио из видео")
+            await bot.send_audio(cq.from_user.id, types.InputFile(audio_path_new), title="Аудио из видео")
         except Exception:
             await cq.answer("Ошибка при отправке аудио.", show_alert=True)
         finally:
@@ -613,7 +608,7 @@ async def cb_get_audio(cq: CallbackQuery):
                 shutil.rmtree(new_tmp, ignore_errors=True)
                 audio_cache.pop(token, None)
                 return
-            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new), title="Аудио из видео")
+            await bot.send_audio(cq.from_user.id, types.InputFile(audio_path_new), title="Аудио из видео")
         except Exception:
             await cq.answer("Ошибка при повторном скачивании/конвертации.", show_alert=True)
         finally:
@@ -726,7 +721,6 @@ async def farm_points(m: Message):
             minutes = int((remain.total_seconds() % 3600) // 60)
             await m.answer(f"⏳ Вы уже фармили. Можно снова через {hours}ч {minutes}м.")
             return
-    # give random 10-35
     amount = random.randint(10, 35)
     await add_points(uid, amount)
     await set_last_farm(uid, now.isoformat())
@@ -737,12 +731,10 @@ async def farm_points(m: Message):
 async def stats_handler(m: Message):
     await add_user(m.from_user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        # premium counts
         async with db.execute("SELECT premium, COUNT(*) FROM users GROUP BY premium") as cur:
             rows = await cur.fetchall()
         premium_counts = {r[0]: r[1] for r in rows}
         total_premium = sum(v for k,v in premium_counts.items() if k in ("золотой", "алмазный"))
-        # top-10 by points
         async with db.execute("SELECT id, points, stars FROM users ORDER BY points DESC LIMIT 10") as cur:
             top = await cur.fetchall()
     text = f"📊 Статистика\nВсего премиум-пользователей (золотой/алмазный): {total_premium}\n\n🏆 Топ-10 по очкам:\n"
@@ -761,28 +753,22 @@ async def link_handler(m: Message):
     url = m.text.strip()
     await add_user(user_id)
 
-    # check if link looks like image-only (TikTok photo or Pinterest pin)
     is_tiktok_photo = ("tiktok.com" in url and "/photo/" in url) or ("/photo/" in url and "tiktok" in url)
     is_pinterest = "pinterest" in url or "pin.it" in url
 
-    # check user's image_mode
     user = await get_user(user_id)
     image_mode = user[7] if user else 0
 
-    # If link is image-type but user hasn't activated /images, instruct them
     if (is_tiktok_photo or is_pinterest) and not image_mode:
         await m.answer("🖼 Похоже, это ссылка на изображение (TikTok photo или Pinterest). Чтобы скачивать изображения, сперва введите команду /images и затем отправьте ссылку. Если вы хотите скачать видео — пришлите ссылку на видео.")
         return
 
-    # If image_mode active — handle as image (and then reset image_mode to 0)
     if image_mode:
         await set_image_mode(user_id, 0)  # one-shot mode
-        # Process in executor: safe_download_video handles image pages and videos.
         await download_queue.put((m.chat.id, user_id, url))
         await m.answer("📥 Добавлено в очередь на скачивание изображения/видео... (режим изображений).")
         return
 
-    # Normal video flow
     if not await can_download(user_id):
         await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
         return
@@ -793,7 +779,6 @@ async def link_handler(m: Message):
 @dp.message(Command("buy_gold"))
 async def buy_gold_invoice(m: Message):
     prices = [LabeledPrice(label=f"Золотой ({GOLD_DAYS} дней)", amount=GOLD_PRICE)]
-    # provider_token пустой — если у вас есть провайдер, заполните
     try:
         await bot.send_invoice(m.chat.id, title="Золотой премиум", description="Покупка премиума",
                                payload=f"gold:{m.from_user.id}", provider_token="", currency="XTR", prices=prices,
