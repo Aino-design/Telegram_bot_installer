@@ -85,6 +85,23 @@ async def can_download(uid: int) -> bool:
         return True
     return downloads < limit
 
+async def get_remaining_downloads(uid: int):
+    user = await get_user(uid)
+
+    if not user:
+        return 4, 4, "обычный"
+
+    premium = user[1] or "обычный"
+    downloads = user[3] or 0
+
+    limit = LIMITS.get(premium, 4)
+
+    # безлимит
+    if limit is None:
+        return None, None, premium
+
+    remaining = max(limit - downloads, 0)
+    return remaining, limit, premium
 
 # ========= DOWNLOAD FUNCTION =========
 @dp.message(Command("convert"))
@@ -143,30 +160,32 @@ async def start_handler(m: Message):
 
 
 @dp.message(Command("profile"))
-async def profile_handler(message: Message):
-    user_id = message.from_user.id
+async def profile_handler(m: Message):
+    user = await get_user(m.from_user.id)
+    await m.answer(
+        f"👤 Профиль\n"
+        f"💎 {user[1]}\n"
+    )
 
-    await ensure_user(user_id, message.from_user.username)
-    row = await get_user_row(user_id)
+@dp.message(Command("limit"))
+async def limit_handler(m: Message):
+    await add_user(m.from_user.id)
 
-    remaining, limit = await get_remaining_downloads(user_id)
+    remaining, limit, premium = await get_remaining_downloads(m.from_user.id)
 
-    if remaining is None:
-        limit_text = "♾ Безлимит"
-    else:
-        limit_text = f"{remaining} из {limit}"
-
-    if row:
-        _, username, premium, downloads_today, _, premium_expires = row
-
-        await message.answer(
-            f"👤 <b>Профиль</b>\n\n"
-            f"🆔 @{username or user_id}\n"
-            f"💎 Премиум: <b>{premium}</b>\n"
-            f"📅 Истекает: {premium_expires or 'нет'}\n"
-            f"📥 Скачано сегодня: {downloads_today}\n"
-            f"📊 Осталось: <b>{limit_text}</b>"
+    if limit is None:
+        text = (
+            "♾ У вас безлимитный тариф\n"
+            f"💎 Статус: {premium}"
         )
+    else:
+        text = (
+            f"📊 Ваш лимит на сегодня:\n\n"
+            f"💎 Статус: {premium}\n"
+            f"⬇️ Осталось скачиваний: {remaining}/{limit}"
+        )
+
+    await m.answer(text)
 
 
 @dp.message(Command("premium"))
