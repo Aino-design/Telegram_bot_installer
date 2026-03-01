@@ -74,6 +74,26 @@ async def increment_download(uid: int):
         await db.execute("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
         await db.commit()
 
+async def reset_if_needed(user_id: int):
+    """Сбрасывает дневной лимит, если новый день"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT reset FROM users WHERE id=?", (user_id,)) as c:
+            row = await c.fetchone()
+            if not row:
+                return
+            last_reset = row[0]
+            if last_reset is None:
+                last_reset = datetime.utcnow().isoformat()
+
+            last_reset_dt = datetime.fromisoformat(last_reset)
+            now = datetime.utcnow()
+
+            # если прошёл день
+            if now.date() > last_reset_dt.date():
+                await db.execute("UPDATE users SET downloads=0, reset=? WHERE id=?",
+                                 (now.isoformat(), user_id))
+                await db.commit()
+
 
 async def can_download(uid: int) -> bool:
     user = await get_user(uid)
@@ -85,22 +105,22 @@ async def can_download(uid: int) -> bool:
         return True
     return downloads < limit
 
-async def get_remaining_downloads(uid: int):
-    user = await get_user(uid)
+async def get_remaining_downloads(user_id: int):
+    await reset_if_needed(user_id)
+    row = await get_user(user_id)
 
-    if not user:
-        return 4, 4, "обычный"
+    if not row:
+        return 4, 4, "обычный"  # downloads, limit, premium
 
-    premium = user[1] or "обычный"
-    downloads = user[3] or 0
+    premium = row[1] or "обычный"  # row[1] — premium
+    downloads_today = row[3] or 0
 
     limit = LIMITS.get(premium, 4)
 
-    # безлимит
     if limit is None:
         return None, None, premium
 
-    remaining = max(limit - downloads, 0)
+    remaining = max(limit - downloads_today, 0)
     return remaining, limit, premium
 
 # ========= DOWNLOAD FUNCTION =========
@@ -233,7 +253,7 @@ async def link_handler(m: Message):
 
 async def get_remaining_downloads(user_id: int):
     await reset_if_needed(user_id)
-    row = await get_user_row(user_id)
+    row = await get_user(user_id)
 
     if not row:
         return 0, 4
