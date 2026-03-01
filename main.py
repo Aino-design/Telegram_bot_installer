@@ -106,18 +106,15 @@ async def can_download(uid: int) -> bool:
     return downloads < limit
 
 async def get_remaining_downloads(user_id: int):
-    await reset_if_needed(user_id)
     row = await get_user(user_id)
-
     if not row:
         return 4, 4, "обычный"  # downloads, limit, premium
 
-    premium = row[1] or "обычный"  # row[1] — premium
+    premium = row[1] or "обычный"
     downloads_today = row[3] or 0
-
     limit = LIMITS.get(premium, 4)
 
-    if limit is None:
+    if limit is None:  # безлимит
         return None, None, premium
 
     remaining = max(limit - downloads_today, 0)
