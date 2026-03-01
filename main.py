@@ -143,24 +143,30 @@ async def start_handler(m: Message):
 
 
 @dp.message(Command("profile"))
-async def profile_handler(m: Message):
-    user = await get_user(m.from_user.id)
-    await m.answer(
-        f"👤 Профиль\n"
-        f"💎 {user[1]}\n"
-    )
-    remaining, limit = await get_remaining_downloads(msg.from_user.id)
+async def profile_handler(message: Message):
+    user_id = message.from_user.id
+
+    await ensure_user(user_id, message.from_user.username)
+    row = await get_user_row(user_id)
+
+    remaining, limit = await get_remaining_downloads(user_id)
 
     if remaining is None:
-        await msg.answer("♾ У вас безлимитные скачивания сегодня.")
-        return
+        limit_text = "♾ Безлимит"
+    else:
+        limit_text = f"{remaining} из {limit}"
 
-    await msg.answer(
-        f"📊 Лимиты на сегодня:\n"
-        f"Всего: {limit}\n"
-        f"Осталось: {remaining}"
-    )
-    await bot.send_message(chat_id, f"📥 Осталось скачиваний сегодня: {remaining}")
+    if row:
+        _, username, premium, downloads_today, _, premium_expires = row
+
+        await message.answer(
+            f"👤 <b>Профиль</b>\n\n"
+            f"🆔 @{username or user_id}\n"
+            f"💎 Премиум: <b>{premium}</b>\n"
+            f"📅 Истекает: {premium_expires or 'нет'}\n"
+            f"📥 Скачано сегодня: {downloads_today}\n"
+            f"📊 Осталось: <b>{limit_text}</b>"
+        )
 
 
 @dp.message(Command("premium"))
