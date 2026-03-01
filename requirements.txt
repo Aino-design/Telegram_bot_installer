@@ -2,3 +2,4 @@ aiogram==3.25.0
 aiosqlite==0.19.0
 yt-dlp>=2025.1.15
 aiohttp>=3.9.0,<3.14.0
+requests
