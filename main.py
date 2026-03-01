@@ -75,26 +75,6 @@ async def increment_download(uid: int):
         await db.execute("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
         await db.commit()
 
-async def reset_if_needed(user_id: int):
-    """Сбрасывает дневной лимит, если новый день"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT reset FROM users WHERE id=?", (user_id,)) as c:
-            row = await c.fetchone()
-            if not row:
-                return
-            last_reset = row[0]
-            if last_reset is None:
-                last_reset = datetime.utcnow().isoformat()
-
-            last_reset_dt = datetime.fromisoformat(last_reset)
-            now = datetime.utcnow()
-
-            # если прошёл день
-            if now.date() > last_reset_dt.date():
-                await db.execute("UPDATE users SET downloads=0, reset=? WHERE id=?",
-                                 (now.isoformat(), user_id))
-                await db.commit()
-
 
 async def can_download(uid: int) -> bool:
     user = await get_user(uid)
@@ -106,22 +86,6 @@ async def can_download(uid: int) -> bool:
         return True
     return downloads < limit
 
-async def get_remaining_downloads(user_id: int):
-    await reset_if_needed(user_id)  # сначала сброс лимита, если нужен
-    user = await get_user(user_id)
-
-    if not user:
-        return 4, 4, "обычный"
-
-    premium = user[1] or "обычный"
-    downloads_today = user[3] or 0
-    limit = LIMITS.get(premium, 4)
-
-    if limit is None:
-        return None, None, premium
-
-    remaining = max(limit - downloads_today, 0)
-    return remaining, limit, premium
 
 # ========= DOWNLOAD FUNCTION =========
 @dp.message(Command("convert"))
@@ -174,6 +138,68 @@ async def reset_if_needed(user_id: int):
                 await db.commit()
 
 
+# ========= limit options ======= #
+# ========= сброс лимита =========
+async def reset_if_needed(user_id: int):
+    user = await get_user(user_id)
+    if not user:
+        return
+    last_reset_str = user[4]  # поле reset
+    now = datetime.utcnow()
+    if last_reset_str:
+        last_reset = datetime.fromisoformat(last_reset_str)
+        if now.date() > last_reset.date():
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET downloads=0, reset=? WHERE id=?",
+                    (now.isoformat(), user_id)
+                )
+                await db.commit()
+    else:
+        # если поля reset нет
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET reset=? WHERE id=?",
+                (now.isoformat(), user_id)
+            )
+            await db.commit()
+
+# ========= получение лимита =========
+async def get_remaining_downloads(user_id: int):
+    await reset_if_needed(user_id)
+    user = await get_user(user_id)
+    # если пользователя нет в базе
+    if not user:
+        return {"remaining": 4, "limit": 4, "premium": "обычный"}
+
+    premium = user[1] or "обычный"
+    downloads_today = user[3] or 0
+    limit = LIMITS.get(premium, 4)
+
+    # безлимит
+    if limit is None:
+        return {"remaining": None, "limit": None, "premium": premium}
+
+    remaining = max(limit - downloads_today, 0)
+    return {"remaining": remaining, "limit": limit, "premium": premium}
+
+# ========= команда /limit =========
+@dp.message(Command("limit"))
+async def limit_handler(m: Message):
+    await add_user(m.from_user.id)
+    data = await get_remaining_downloads(m.from_user.id)
+
+    if data["limit"] is None:
+        text = f"♾ У вас безлимитный тариф\n💎 Статус: {data['premium']}"
+    else:
+        text = (
+            f"📊 Ваш лимит на сегодня:\n"
+            f"💎 Статус: {data['premium']}\n"
+            f"⬇️ Осталось скачиваний: {data['remaining']}/{data['limit']}"
+        )
+
+    await m.answer(text)
+
 # ========= COMMANDS =========
 @dp.message(CommandStart())
 async def start_handler(m: Message):
@@ -202,25 +228,6 @@ async def profile_handler(m: Message):
         f"💎 {user[1]}\n"
     )
 
-@dp.message(Command("limit"))
-async def limit_handler(m: Message):
-    await add_user(m.from_user.id)
-
-    remaining, limit, premium = await get_remaining_downloads(m.from_user.id)
-
-    if limit is None:
-        text = (
-            "♾ У вас безлимитный тариф\n"
-            f"💎 Статус: {premium}"
-        )
-    else:
-        text = (
-            f"📊 Ваш лимит на сегодня:\n\n"
-            f"💎 Статус: {premium}\n"
-            f"⬇️ Осталось скачиваний: {remaining}/{limit}"
-        )
-
-    await m.answer(text)
 
 
 @dp.message(Command("premium"))
