@@ -239,85 +239,56 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
 
 def safe_download_video(url: str, folder: str) -> None:
     logger.info("safe_download_video start url=%s", url)
-    # Tiktok photo fallback
-    try:
-        if "tiktok.com" in url and "/photo/" in url:
-            url = sanitize_tiktok_photo_url(url)
-            saved = fetch_and_save_images_page(url, folder, limit=20)
-            if saved:
-                return
-            # try to pull images from known JSON/markup patterns
-            try:
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
-                html = r.text
-                # look for urlList or displayUrl
-                imgs = re.findall(r'"urlList":\s*\[(.*?)\]', html)
-                if imgs:
-                    inside = imgs[0]
-                    urls = re.findall(r'"(https?://[^"]+)"', inside)
-                    for i, u in enumerate(urls, start=1):
-                        ext = "jpg"
-                        dest = os.path.join(folder, f"photo_{i}.{ext}")
-                        download_file_sync(u, dest)
-                    if any(os.path.exists(os.path.join(folder, f)) for f in os.listdir(folder)):
-                        return
-            except Exception:
-                pass
-            # final attempt with yt-dlp
-            try:
-                download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
-                return
-            except Exception as e:
-                logger.info("tiktok photo final yt-dlp failed: %s", e)
-                # try direct HTML fetch again
-                saved2 = fetch_and_save_images_page(url, folder, limit=20)
-                if saved2:
-                    return
-                raise
 
-        # resolve short links
-        if any(s in url for s in ("vm.tiktok.com", "vt.tiktok.com", "https://vt.", "https://vm.", "https://vm")):
-            url = resolve_redirect(url)
+    # ===== TIKTOK PHOTO POST =====
+    if "tiktok.com" in url and "/photo/" in url:
+        logger.info("Detected TikTok PHOTO post")
 
-        # main attempt
         try:
-            filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
-            logger.info("yt-dlp downloaded: %s", filename)
-            return
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            html = r.text
         except Exception as e:
-            msg = str(e).lower()
-            logger.warning("yt-dlp failed: %s", msg)
-            # fallback to HTML images for Pinterest / image-only pages
-            if "pinterest" in msg or "requested format is not available" in msg or "no video formats" in msg or "unsupported" in msg:
-                saved = fetch_and_save_images_page(url, folder, limit=20)
-                if saved:
-                    return
-            # try gentler yt-dlp
-            try:
-                outtmpl = os.path.join(folder, "%(id)s.%(ext)s")
-                ydl_opts2 = {
-                    "outtmpl": outtmpl,
-                    "format": "best",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "ignoreerrors": False,
-                    "noplaylist": True,
-                    "http_headers": {"User-Agent": "Mozilla/5.0"},
-                    "allow_unplayable_formats": True,
-                }
-                if USE_COOKIES:
-                    ydl_opts2["cookiefile"] = COOKIES_FILE
-                with YoutubeDL(ydl_opts2) as ydl:
-                    ydl.download([url])
-                return
-            except Exception as e2:
-                logger.warning("second yt-dlp attempt failed: %s", e2)
-                saved = fetch_and_save_images_page(url, folder, limit=20)
-                if saved:
-                    return
-                raise
-    except Exception as e_main:
-        logger.exception("safe_download_video final fail: %s", e_main)
+            raise Exception("Не удалось загрузить страницу TikTok")
+
+        # Ищем ВСЕ реальные картинки TikTok
+        matches = re.findall(r'"displayUrl":"(https:[^"]+)"', html)
+
+        if not matches:
+            matches = re.findall(r'https://[^"]+\.jpeg', html)
+
+        if not matches:
+            raise Exception("Фото не найдены (TikTok изменил формат страницы)")
+
+        saved = 0
+        for i, img in enumerate(set(matches), start=1):
+            img = img.replace("\\u002F", "/").replace("\\", "")
+            path = os.path.join(folder, f"photo_{i}.jpg")
+
+            if download_file_sync(img, path):
+                saved += 1
+
+        if saved == 0:
+            raise Exception("Не удалось скачать фото")
+
+        logger.info("TikTok photos downloaded: %s", saved)
+        return
+
+    # ===== SHORT LINKS =====
+    if any(s in url for s in ("vm.tiktok.com", "vt.tiktok.com")):
+        url = resolve_redirect(url)
+
+    # ===== NORMAL DOWNLOAD =====
+    try:
+        download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
+        return
+    except Exception as e:
+        logger.warning("yt-dlp failed: %s", e)
+
+        # fallback — пробуем как страницу с картинками
+        saved = fetch_and_save_images_page(url, folder, limit=20)
+        if saved:
+            return
+
         raise
 
 # ---------- ffmpeg audio extraction ----------
