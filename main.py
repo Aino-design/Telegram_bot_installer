@@ -1,4 +1,4 @@
-# main.py — полный рабочий файл
+# main.py — полностью готовый рабочий файл
 import asyncio
 import os
 import tempfile
@@ -18,33 +18,33 @@ from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 )
 
-# --------------- Настройки и логирование ---------------
+# ---------- Настройки / лог ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"   # <- Поставь реальный токен
+TOKEN = os.getenv("TOKEN") or "ТОКЕН_БОТП"   # <- вставь реальный токен
 ADMIN_ID = 6705555401
 DB_PATH = "bot_db.sqlite"
 
-# Premium settings
+# премиум настройки
 GOLD_PRICE = 120
 GOLD_DAYS = 30
 DIAMOND_PRICE = 250
 DIAMOND_DAYS = 90
 LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
 
-# TTL для кеша аудио (в секундах)
-AUDIO_TTL_SECONDS = 10 * 60  # 10 минут
+# TTL для временных файлов — 30 минут (уменьшает шанс истечения раньше)
+AUDIO_TTL_SECONDS = 30 * 60  # 30 минут
 
-# Инициализация бота и очереди
+# бот и очередь
 bot = Bot(TOKEN)
 dp = Dispatcher()
 download_queue: asyncio.Queue = asyncio.Queue()
 
-# Кеш для аудио: token -> {"audio": path, "tmpdir": tmpdir}
-audio_cache: Dict[str, Dict[str, Optional[str]]] = {}
+# кеш: token -> {"audio": path|null, "tmpdir": tmpdir, "video": filename, "url": original_url, "owner": user_id}
+audio_cache: Dict[str, Dict[str, Optional[Any]]] = {}
 
-# --------------- База данных ---------------
+# ---------- БД ----------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -60,7 +60,6 @@ async def init_db():
     logger.info("DB initialized")
 
 async def add_user(uid: int):
-    # добавит пользователя, если нет
     now_iso = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO users(id, reset) VALUES(?, ?)", (uid, now_iso))
@@ -87,7 +86,7 @@ async def increment_download(uid: int):
         await db.execute("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
         await db.commit()
 
-# --------------- Логика сброса лимитов ---------------
+# ---------- Сброс лимитов и проверки ----------
 async def reset_if_needed(user_id: int):
     if not isinstance(user_id, int):
         return
@@ -121,7 +120,6 @@ async def can_download(uid: int) -> bool:
     return downloads < limit
 
 async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional[int], str]:
-    # возвращает (remaining, limit, premium)
     if not isinstance(user_id, int):
         raise TypeError("user_id must be int")
     await reset_if_needed(user_id)
@@ -136,9 +134,8 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
     remaining = max(limit - downloads_today, 0)
     return remaining, limit, premium
 
-# --------------- yt-dlp скачивание ---------------
+# ---------- yt-dlp скачивание ----------
 def download_video(url: str, folder: str):
-    # сохраняет в folder/video.<ext>
     ydl_opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(folder, "video.%(ext)s"),
@@ -151,7 +148,7 @@ def download_video(url: str, folder: str):
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-# --------------- ffmpeg извлечение аудио ---------------
+# ---------- ffmpeg извлечение аудио ----------
 async def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -183,7 +180,7 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         logger.exception("cleanup_audio_after_delay failed for token %s", token)
     audio_cache.pop(token, None)
 
-# --------------- Очередной воркер (основная вставка) ---------------
+# ---------- Download worker (скачивает, отправляет видео + кнопку) ----------
 async def download_worker():
     while True:
         chat_id, user_id, url = await download_queue.get()
@@ -191,10 +188,10 @@ async def download_worker():
         token: Optional[str] = None
         try:
             await bot.send_message(chat_id, "⏳ Скачиваю видео...")
-            # скачиваем в tmp
+            # скачиваем (в блоке executor)
             await asyncio.get_event_loop().run_in_executor(None, download_video, url, tmp)
 
-            # ищем видео-файл в tmp
+            # находим видео
             video_path: Optional[str] = None
             for f in os.listdir(tmp):
                 if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
@@ -206,33 +203,20 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # аудио путь
-            audio_path = os.path.join(tmp, "audio.mp3")
-
-            # извлекаем аудио (ассинхронно)
-            audio_ok = False
-            try:
-                audio_ok = await extract_audio_ffmpeg(video_path, audio_path)
-            except Exception:
-                logger.exception("Ошибка при extract_audio_ffmpeg")
-
-            # токен для callback
+            # подготавливаем токен и клавиатуру
             token = uuid.uuid4().hex
-
-            # клавиатура
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Получить песню 🎵", callback_data=f"get_audio:{token}")]
             ])
-
             caption_text = "✅ Готово!\nХотите конвертировать только песню?"
 
-            # отправка видео
+            # Отправляем видео (video или document)
             sent_ok = False
             try:
                 await bot.send_video(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
                 sent_ok = True
             except Exception:
-                logger.exception("send_video failed; try send_document")
+                logger.exception("send_video failed; trying send_document")
                 try:
                     await bot.send_document(chat_id, FSInputFile(video_path), caption=caption_text, reply_markup=kb)
                     sent_ok = True
@@ -245,17 +229,22 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # увеличиваем счётчик
+            # увеличиваем счётчик скачиваний
             try:
                 await increment_download(user_id)
             except Exception:
                 logger.exception("increment_download failed for %s", user_id)
 
-            # кладём в кеш (даже если audio_ok False — кладём запись с None)
-            audio_cache[token] = {"audio": audio_path if audio_ok and os.path.exists(audio_path) else None,
-                                  "tmpdir": tmp}
+            # кладём в кеш метаданные (audio=None пока)
+            audio_cache[token] = {
+                "audio": None,
+                "tmpdir": tmp,
+                "video": video_path,
+                "url": url,
+                "owner": user_id
+            }
 
-            # запланируем очистку
+            # запланируем удаление tmp через TTL
             asyncio.create_task(cleanup_audio_after_delay(token, AUDIO_TTL_SECONDS))
 
         except Exception as exc:
@@ -268,51 +257,127 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
             except Exception:
                 pass
-        # НЕ удаляем tmp тут если в audio_cache есть запись — она будет удалена позже
+        # не удаляем tmp здесь, т.к. он нужен для callback-аудио
 
-# --------------- Callback (обработчик кнопки) ---------------
+# ---------- Callback: обработка нажатия "Получить песню" ----------
 @dp.callback_query(lambda c: c.data and c.data.startswith("get_audio:"))
 async def cb_get_audio(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
     info = audio_cache.get(token)
 
+    # если информация отсутствует — просим пользователя отправить ссылку снова
     if not info:
-        await cq.answer("Аудио устарело или недоступно.", show_alert=True)
+        await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
         return
 
-    audio_path = info.get("audio")
+    # защита: только владелец или админ может запрашивать (опционально)
+    owner = info.get("owner")
+    if owner and cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
+        await cq.answer("Только пользователь, запросивший видео, может получить аудио.", show_alert=True)
+        return
+
+    audio_path = info.get("audio")  # может быть None
     tmpdir = info.get("tmpdir")
+    video_path = info.get("video")
+    url = info.get("url")
 
-    if not audio_path or not os.path.exists(audio_path):
-        await cq.answer("Аудио не было извлечено или уже удалено.", show_alert=True)
-        # удаляем tmpdir если есть
+    # Если mp3 уже есть — просто отправляем
+    if audio_path and os.path.exists(audio_path):
         try:
-            if tmpdir and os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            await cq.answer()  # закрывает индикатор
+            await bot.send_chat_action(cq.from_user.id, "upload_audio")
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path))
         except Exception:
-            logger.exception("Failed to remove tmpdir after missing audio")
-        audio_cache.pop(token, None)
+            await cq.answer("Ошибка при отправке аудио.", show_alert=True)
+        finally:
+            # почистим tmp и кеш
+            try:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+                if tmpdir and os.path.exists(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                logger.exception("Cleanup after send audio failed")
+            audio_cache.pop(token, None)
         return
 
-    try:
-        await cq.answer()  # убирает "крутилку"
-        await bot.send_chat_action(cq.from_user.id, "upload_audio")
-        await bot.send_audio(cq.from_user.id, FSInputFile(audio_path))
-    except Exception:
-        await cq.answer("Ошибка при отправке аудио.", show_alert=True)
+    # Если mp3 ещё не создан, но видео-файл есть — создаём mp3
+    if video_path and os.path.exists(video_path):
+        # делаем путь для аудио
+        audio_path_new = os.path.join(tmpdir, "audio.mp3")
+        await cq.answer()  # закроет индикатор
+        await bot.send_chat_action(cq.from_user.id, "record_audio")
+        success = await extract_audio_ffmpeg(video_path, audio_path_new)
+        if not success:
+            await cq.answer("Не удалось извлечь аудио из видео.", show_alert=True)
+            # опционально: удаляем tmp чтобы не лежал мусор
+            try:
+                if tmpdir and os.path.exists(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            audio_cache.pop(token, None)
+            return
+        # если получилось — отправляем
+        try:
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new))
+        except Exception:
+            await cq.answer("Ошибка при отправке аудио.", show_alert=True)
+            # не обломаем — удаляем файлы
+        finally:
+            # удаляем файлы и кеш
+            try:
+                if os.path.exists(audio_path_new):
+                    os.remove(audio_path_new)
+                if tmpdir and os.path.exists(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                logger.exception("Cleanup after send audio failed")
+            audio_cache.pop(token, None)
         return
 
-    # после успешной отправки — удалим tmp и запись
-    try:
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
-        if tmpdir and os.path.exists(tmpdir):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:
-        logger.exception("Error cleaning tmp after sending audio")
+    # Если ни видео ни mp3 нет (файлы удалены), пробуем перезагрузить — но без гарантии:
+    if url:
+        # попробуем заново скачать в новый tmp и извлечь
+        new_tmp = tempfile.mkdtemp()
+        try:
+            await cq.answer("Аудио недоступно, заново скачиваю и извлекаю...", show_alert=True)
+            await asyncio.get_event_loop().run_in_executor(None, download_video, url, new_tmp)
+            # найти видео
+            new_video = None
+            for f in os.listdir(new_tmp):
+                if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts")):
+                    new_video = os.path.join(new_tmp, f)
+                    break
+            if not new_video:
+                await cq.answer("Не удалось повторно скачать видео.", show_alert=True)
+                shutil.rmtree(new_tmp, ignore_errors=True)
+                audio_cache.pop(token, None)
+                return
+            audio_path_new = os.path.join(new_tmp, "audio.mp3")
+            success = await extract_audio_ffmpeg(new_video, audio_path_new)
+            if not success:
+                await cq.answer("Не удалось извлечь аудио после повторного скачивания.", show_alert=True)
+                shutil.rmtree(new_tmp, ignore_errors=True)
+                audio_cache.pop(token, None)
+                return
+            await bot.send_audio(cq.from_user.id, FSInputFile(audio_path_new))
+        except Exception as e:
+            logger.exception("Re-download+extract failed: %s", e)
+            await cq.answer("Ошибка при повторном скачивании/конвертации.", show_alert=True)
+        finally:
+            try:
+                shutil.rmtree(new_tmp, ignore_errors=True)
+            except Exception:
+                pass
+            audio_cache.pop(token, None)
+        return
+
+    # В остальных случаях сообщаем, что аудио недоступно
+    await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
     audio_cache.pop(token, None)
 
-# --------------- Команды бота ---------------
+# ---------- Команды ----------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await add_user(m.from_user.id)
@@ -345,7 +410,8 @@ async def profile_handler(m: Message):
 async def premium_handler(m: Message):
     await m.answer(
         f"💎 Премиум:\n"
-        f"Обычный(по умолчанию)\n" f"4 видео в день обычное\n\n"
+        f"Обычный(по умолчанию)\n"
+        f"4 видео в день обычное\n\n"
         f"🥇 Золотой — {GOLD_PRICE}⭐ ({GOLD_DAYS} дней)\n" f"10 видео в день - хорошее разрешение\n\n"
         f"💠 Алмазный — {DIAMOND_PRICE}⭐ ({DIAMOND_DAYS} дней)\n" f"неограниченные видео в день - высокое разрешение - приоритет\n\n"
         "Команды:\n/buy_gold\n/buy_diamond"
@@ -373,23 +439,42 @@ async def buy_diamond(m: Message):
 async def pre_checkout(q: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(q.id, ok=True)
 
-# Команда конверта — просит прислать ссылку (твоя ранее)
 @dp.message(Command("convert"))
 async def cmd_convert(m: Message):
     await add_user(m.from_user.id)
     await m.answer("🔗 Отправьте ссылку на видео и я обработаю его и пришлю вам!")
 
-# Обработка ссылок (простая очередь)
 @dp.message(F.text.startswith("http"))
 async def link_handler(m: Message):
     user_id = m.from_user.id
+    await add_user(user_id)
     if not await can_download(user_id):
         await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
         return
     await download_queue.put((m.chat.id, user_id, m.text))
     await m.answer("📥 Добавлено в очередь...")
 
-# --------------- Админ команды ---------------
+# ---------- Команда /limit ----------
+@dp.message(Command("limit"))
+async def limit_handler(m: Message):
+    await add_user(m.from_user.id)
+    try:
+        remaining, limit, premium = await get_remaining_downloads(m.from_user.id)
+    except Exception as e:
+        await m.answer(f"Ошибка при получении лимита: {e}")
+        return
+
+    if limit is None:
+        text = f"♾ У вас безлимитный тариф\n💎 Статус: {premium}"
+    else:
+        text = (
+            f"📊 Ваш лимит на сегодня:\n\n"
+            f"💎 Статус: {premium}\n"
+            f"⬇️ Осталось скачиваний: {remaining}/{limit}"
+        )
+    await m.answer(text)
+
+# ---------- Админ команды ----------
 @dp.message(Command("admin"))
 async def admin_handler(m: Message):
     if m.from_user.id != ADMIN_ID:
@@ -437,17 +522,14 @@ async def add_stars_handler(m: Message):
     except Exception:
         await m.answer("❌ Неверный формат. /add_stars ID сумма")
 
-# --------------- Запуск бота ---------------
+# ---------- Запуск ----------
 async def main():
     await init_db()
-
-    # Убираем возможный webhook и падение по конфликту
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
-        logger.exception("Failed to delete webhook (ok to ignore)")
+        logger.exception("delete_webhook (ok to ignore)")
 
-    # стартуем воркер и polling
     asyncio.create_task(download_worker())
     await dp.start_polling(bot)
 
