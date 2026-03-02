@@ -1,9 +1,6 @@
-# main.py — финальная версия: видео + отдельная команда для изображений (TikTok photo / Pinterest),
-# "Очки" (points) с фармингом каждые 20 часов, покупка премиума очками или звёздами,
-# /stats показывает количество премиум-пользователей и топ-10 по очкам.
-# Внимание: перед запуском убедитесь, что в requirements.txt есть:
-# aiogram, aiosqlite, yt-dlp, requests
-# И ffmpeg доступен в PATH (для извлечения аудио).
+# main.py — упрощённая версия: остались только /start, /about, /premium и /admin (+ админ-подкоманды)
+# Бот скачивает видео и изображения по ссылкам (YouTube, TikTok, Pinterest и др.)
+# Требования: aiogram, aiosqlite, yt-dlp, requests. ffmpeg должен быть в PATH.
 import os
 import re
 import json
@@ -36,8 +33,8 @@ TOKEN = os.getenv("TOKEN") or "8687253696:AAGxeaingqzbCIGPqWsziXr4VYN0Bpopmm8"  
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
-# премиум / цены (с использованием тех же чисел что и раньше)
-GOLD_PRICE = int(os.getenv("GOLD_PRICE") or 120)      # цена в звёздах или очках
+# премиум / цены (можно оставить значения, используются админ-командами)
+GOLD_PRICE = int(os.getenv("GOLD_PRICE") or 120)
 GOLD_DAYS = int(os.getenv("GOLD_DAYS") or 30)
 DIAMOND_PRICE = int(os.getenv("DIAMOND_PRICE") or 250)
 DIAMOND_DAYS = int(os.getenv("DIAMOND_DAYS") or 90)
@@ -63,7 +60,6 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
 # -------------------- БД: init и помощники --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # добавляем колонки points (очки), image_mode (флаг ожидания изображений), last_farm (для cooldown)
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY,
@@ -135,17 +131,7 @@ async def increment_download(uid: int):
         await db.execute("UPDATE users SET downloads = downloads + 1 WHERE id=?", (uid,))
         await db.commit()
 
-async def set_image_mode(uid: int, mode: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET image_mode=? WHERE id=?", (mode, uid))
-        await db.commit()
-
-async def set_last_farm(uid: int, iso_ts: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET last_farm=? WHERE id=?", (iso_ts, uid))
-        await db.commit()
-
-# лимиты
+# reset / limits helpers (оставлены)
 async def reset_if_needed(user_id: int):
     if not isinstance(user_id, int):
         return
@@ -178,21 +164,6 @@ async def can_download(uid: int) -> bool:
         return True
     return downloads < limit
 
-async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional[int], str]:
-    if not isinstance(user_id, int):
-        raise TypeError("user_id must be int")
-    await reset_if_needed(user_id)
-    user = await get_user(user_id)
-    if not user:
-        return 4, 4, "обычный"
-    premium = user[1] or "обычный"
-    downloads_today = user[4] or 0
-    limit = LIMITS.get(premium, 4)
-    if limit is None:
-        return None, None, premium
-    remaining = max(limit - downloads_today, 0)
-    return remaining, limit, premium
-
 # -------------------- Вспомогательные функции для веба --------------------
 def resolve_redirect(url: str, timeout: int = 10) -> str:
     try:
@@ -215,15 +186,12 @@ def find_image_urls_from_html(html: str) -> List[str]:
     urls = []
     for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)', html, flags=re.IGNORECASE):
         urls.append(m.group(0))
-    # JSON-like search
     for key in ('displayUrl','originCover','cover','downloadAddr','originImage','poster','og:image'):
         for m in re.finditer(rf'"{key}"\s*:\s*"(https?://[^"]+)"', html, flags=re.IGNORECASE):
             urls.append(m.group(1))
-    # OG meta fallback
     m = re.search(r'<meta property="og:image" content="([^"]+)"', html)
     if m:
         urls.append(m.group(1))
-    # dedupe preserve order
     seen = set(); out = []
     for u in urls:
         uu = u.replace('\\u002F', '/').replace('\\/', '/').replace('\\', '')
@@ -253,7 +221,6 @@ def fetch_and_save_images_page(url: str, folder: str, limit: int = 10) -> List[s
         logger.debug("fetch page failed %s", e)
         return saved
     img_urls = find_image_urls_from_html(html)
-    # Try extracting TikTok SIGI_STATE JSON block for more images
     if not img_urls:
         m = re.search(r'<script[^>]*id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>', html, flags=re.DOTALL | re.IGNORECASE)
         if m:
@@ -266,7 +233,7 @@ def fetch_and_save_images_page(url: str, folder: str, limit: int = 10) -> List[s
                     img_urls.append(u)
             except Exception:
                 pass
-    img_urls = list(dict.fromkeys(img_urls))  # dedupe keep order
+    img_urls = list(dict.fromkeys(img_urls))
     for i, img_url in enumerate(img_urls[:limit], start=1):
         if img_url.startswith("//"):
             img_url = "https:" + img_url
@@ -315,11 +282,10 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
 
 def safe_download_video(url: str, folder: str) -> None:
     logger.info("safe_download_video start url=%s", url)
-    # Resolve redirects for short urls
     if any(s in url for s in ("vm.tiktok.com", "vt.tiktok.com", "https://vm.", "https://vt.")):
         url = resolve_redirect(url)
 
-    # --- TikTok photo: DO NOT call yt-dlp; parse HTML and save up to 10 images ---
+    # TikTok photo post: сохранение изображений (до 10)
     if "tiktok.com" in url and "/photo/" in url:
         logger.info("Detected TikTok photo post — parsing page for images")
         url = sanitize_tiktok_photo_url(url)
@@ -327,7 +293,7 @@ def safe_download_video(url: str, folder: str) -> None:
         if saved:
             logger.info("TikTok photos saved count=%d", len(saved))
             return
-        # try SIGI_STATE extractions
+        # пробуем более глубокий парсинг (SIGI_STATE)
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
             html = r.text
@@ -364,7 +330,7 @@ def safe_download_video(url: str, folder: str) -> None:
             pass
         raise Exception("Не удалось найти/скачать фото TikTok (формат страницы нестандартный)")
 
-    # --- Pinterest: try ytdlp first (pins can be videos), else HTML images ---
+    # Pinterest: сначала yt-dlp (pins могут быть видео), затем HTML fallback
     if "pinterest" in url or "pin.it" in url:
         try:
             filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
@@ -378,7 +344,7 @@ def safe_download_video(url: str, folder: str) -> None:
                 return
             raise
 
-    # --- General: try ytdlp then fallback to HTML images ---
+    # Общий поток: yt-dlp, затем HTML fallback
     try:
         filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
         logger.info("yt-dlp downloaded: %s", filename)
@@ -450,12 +416,10 @@ async def download_worker():
             if image_paths and not video_path:
                 try:
                     images_to_send = sorted(image_paths)[:10]
-                    # Попытка отправить media_group
                     try:
                         media = [types.InputMediaPhoto(media=FSInputFile(path)) for path in images_to_send]
                         await bot.send_media_group(chat_id, media=media)
                     except Exception:
-                        # fallback: отправка по одному
                         for path in images_to_send:
                             await bot.send_photo(chat_id, FSInputFile(path))
                     await bot.send_message(chat_id, f"✅ Готово! (изображения: {len(images_to_send)})")
@@ -627,122 +591,84 @@ async def cb_get_audio(cq: CallbackQuery):
     await cq.answer("Аудио устарело или недоступно — пришлите ссылку ещё раз.", show_alert=True)
     audio_cache.pop(token, None)
 
-# -------------------- Команды: базовые --------------------
+# -------------------- Команды: базовые (оставлены) --------------------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await add_user(m.from_user.id)
-    info = "🔥TikGram_bot\n\nОтправь ссылку на видео (YouTube, TikTok, Pinterest и т. д.) — бот скачает видео.\n" \
-           "Если хочешь скачивать ИЗОБРАЖЕНИЯ (TikTok photo / Pinterest), сперва введи команду /images, " \
-           "а затем отправь ссылку на изображение. Иначе бот предложит сначала использовать /images."
+    info = "🔥TikGram_bot\n\nОтправь ссылку на видео (YouTube, TikTok, Pinterest и т. д.) — бот скачает и пришлёт медиа.\n\n" \
+           "Команды:\n" \
+           "/about — О боте\n" \
+           "/premium — Информация о вашем премиуме (уровень, срок)\n\n(Админ-панель доступна владельцу через /admin)"
     if USE_COOKIES:
-        info += "\n(Используется cookies.txt для авторизованных пинов)"
+        info += "\n\n(Используется cookies.txt для авторизованных пинов)"
     await m.answer(info)
-
-@dp.message(Command("menu"))
-async def cmd_menu(m: Message):
-    await add_user(m.from_user.id)
-    await m.answer("🔥TikGram_bot\n\n/convert — отправьте ссылку на видео\n/images — режим для отправки ссылок на изображения (TikTok photo, Pinterest)\n/farm — фарм очков (раз в 20 часов)\n/stats — статистика и топ по очкам")
 
 @dp.message(Command("about"))
 async def about_handler(m: Message):
-    info = "🤖 Бот скачивает видео и изображения (отдельный режим). Может вырезать аудио из видео.\n" \
-           "Платежи: звёзды ⭐ и очки (points)."
+    info = "🤖 Этот бот скачивает видео и изображения по ссылкам (YouTube, TikTok, Pinterest и др.).\n" \
+           "Также можно получить только аудиодорожку через кнопку «Получить песню 🎵» после отправки видео.\n" \
+           "Требования для сервера: ffmpeg в PATH, yt-dlp и requests/aiosqlite установлены."
     await m.answer(info)
 
-@dp.message(Command("convert"))
-async def cmd_convert(m: Message):
+@dp.message(Command("premium"))
+async def premium_handler(m: Message):
     await add_user(m.from_user.id)
-    await m.answer("🔗 Отправьте ссылку на видео и я обработаю его и пришлю вам!")
+    user = await get_user(m.from_user.id)
+    if not user:
+        await m.answer("👤 Не найден профиль.")
+        return
+    premium = user[1] or "обычный"
+    expires = user[6] or "—"
+    stars = user[2] or 0
+    points = user[3] or 0
+    text = (
+        f"💎 Уровень премиума: {premium}\n"
+        f"⏳ Действует до: {expires}\n"
+        f"⭐ Звёзды: {stars}\n"
+        f"🔹 Очки: {points}\n\n"
+        "Если хотите купить премиум — напишите админу."
+    )
+    await m.answer(text)
 
-# -------------------- Команда /images (включить режим изображений) --------------------
-@dp.message(Command("images"))
-async def images_mode_on(m: Message):
-    await add_user(m.from_user.id)
-    await set_image_mode(m.from_user.id, 1)
-    await m.answer("🖼 Режим изображений включён. Теперь пришлите ссылку на TikTok photo или Pinterest (одно сообщение). После обработки режим выключится автоматически.")
+# -------------------- Обработка входящих ссылок — теперь ВСЕ ссылки автоматически обрабатываются --------------------
+@dp.message(F.text.startswith("http"))
+async def link_handler(m: Message):
+    user_id = m.from_user.id
+    url = m.text.strip()
+    await add_user(user_id)
 
-# -------------------- Команды для покупки премиума очками или звёздами --------------------
-@dp.message(Command("buy_gold_points"))
-async def buy_gold_points(m: Message):
-    await add_user(m.from_user.id)
-    uid = m.from_user.id
-    ok = await use_points(uid, GOLD_PRICE)
-    if ok:
-        await set_premium(uid, "золотой", GOLD_DAYS)
-        await m.answer(f"✅ Вы купили Золотой премиум за {GOLD_PRICE} очков на {GOLD_DAYS} дней.")
-    else:
-        await m.answer(f"❌ У вас недостаточно очков. Цена: {GOLD_PRICE} очков.")
+    # сразу проверяем лимит загрузок
+    if not await can_download(user_id):
+        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
+        return
 
-@dp.message(Command("buy_diamond_points"))
-async def buy_diamond_points(m: Message):
-    await add_user(m.from_user.id)
-    uid = m.from_user.id
-    ok = await use_points(uid, DIAMOND_PRICE)
-    if ok:
-        await set_premium(uid, "алмазный", DIAMOND_DAYS)
-        await m.answer(f"✅ Вы купили Алмазный премиум за {DIAMOND_PRICE} очков на {DIAMOND_DAYS} дней.")
-    else:
-        await m.answer(f"❌ У вас недостаточно очков. Цена: {DIAMOND_PRICE} очков.")
+    # добавляем в очередь — worker уже умеет различать видео/изображения и отправлять их
+    await download_queue.put((m.chat.id, user_id, url))
+    await m.answer("📥 Добавлено в очередь на скачивание...")
 
-@dp.message(Command("buy_gold_stars"))
-async def buy_gold_stars(m: Message):
-    await add_user(m.from_user.id)
-    uid = m.from_user.id
-    ok = await use_stars(uid, GOLD_PRICE)
-    if ok:
-        await set_premium(uid, "золотой", GOLD_DAYS)
-        await m.answer(f"✅ Вы купили Золотой премиум за {GOLD_PRICE}⭐ на {GOLD_DAYS} дней.")
-    else:
-        await m.answer(f"❌ У вас недостаточно звёзд. Цена: {GOLD_PRICE}⭐.")
+# -------------------- Админ и админ-подкоманды --------------------
+@dp.message(Command("admin"))
+async def admin_handler(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    await m.answer(
+        "🛠 Админ панель:\n"
+        "/stats — Статистика и топ (в таблице users)\n"
+        "/give_gold ID — Выдать Золотой (30 дней)\n"
+        "/give_diamond ID — Выдать Алмазный (90 дней)\n"
+        "/add_stars ID сумма — Начислить звёзды\n"
+        "/give_points ID сумма — Выдать очки"
+    )
 
-@dp.message(Command("buy_diamond_stars"))
-async def buy_diamond_stars(m: Message):
-    await add_user(m.from_user.id)
-    uid = m.from_user.id
-    ok = await use_stars(uid, DIAMOND_PRICE)
-    if ok:
-        await set_premium(uid, "алмазный", DIAMOND_DAYS)
-        await m.answer(f"✅ Вы купили Алмазный премиум за {DIAMOND_PRICE}⭐ на {DIAMOND_DAYS} дней.")
-    else:
-        await m.answer(f"❌ У вас недостаточно звёзд. Цена: {DIAMOND_PRICE}⭐.")
-
-# -------------------- Фарм очков (каждые 20 часов) --------------------
-@dp.message(Command("farm"))
-async def farm_points(m: Message):
-    await add_user(m.from_user.id)
-    uid = m.from_user.id
-    user = await get_user(uid)
-    last_farm_iso = user[8] if user else None
-    now = datetime.now(timezone.utc)
-    if last_farm_iso:
-        try:
-            last = datetime.fromisoformat(last_farm_iso)
-        except Exception:
-            last = datetime.fromtimestamp(0, timezone.utc)
-        delta = now - last
-        if delta < timedelta(hours=20):
-            remain = timedelta(hours=20) - delta
-            hours = int(remain.total_seconds() // 3600)
-            minutes = int((remain.total_seconds() % 3600) // 60)
-            await m.answer(f"⏳ Вы уже фармили. Можно снова через {hours}ч {minutes}м.")
-            return
-    # give random 10-35
-    amount = random.randint(10, 35)
-    await add_points(uid, amount)
-    await set_last_farm(uid, now.isoformat())
-    await m.answer(f"🎉 Вы получили {amount} очков! (Можно фармить снова через 20 часов)")
-
-# -------------------- Команда /stats — premium count + top-10 by points --------------------
-@dp.message(Command("stats"))
-async def stats_handler(m: Message):
-    await add_user(m.from_user.id)
+@dp.message(F.text.startswith("/stats"))
+async def stats_handler_admin(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
     async with aiosqlite.connect(DB_PATH) as db:
-        # premium counts
         async with db.execute("SELECT premium, COUNT(*) FROM users GROUP BY premium") as cur:
             rows = await cur.fetchall()
         premium_counts = {r[0]: r[1] for r in rows}
         total_premium = sum(v for k,v in premium_counts.items() if k in ("золотой", "алмазный"))
-        # top-10 by points
         async with db.execute("SELECT id, points, stars FROM users ORDER BY points DESC LIMIT 10") as cur:
             top = await cur.fetchall()
     text = f"📊 Статистика\nВсего премиум-пользователей (золотой/алмазный): {total_premium}\n\n🏆 Топ-10 по очкам:\n"
@@ -753,93 +679,6 @@ async def stats_handler(m: Message):
             uid, pts, stars = row
             text += f"{i}. {uid} — {pts} очков, {stars or 0}⭐\n"
     await m.answer(text)
-
-# -------------------- Обработка входящих ссылок --------------------
-@dp.message(F.text.startswith("http"))
-async def link_handler(m: Message):
-    user_id = m.from_user.id
-    url = m.text.strip()
-    await add_user(user_id)
-
-    # check if link looks like image-only (TikTok photo or Pinterest pin)
-    is_tiktok_photo = ("tiktok.com" in url and "/photo/" in url) or ("/photo/" in url and "tiktok" in url)
-    is_pinterest = "pinterest" in url or "pin.it" in url
-
-    # check user's image_mode
-    user = await get_user(user_id)
-    image_mode = user[7] if user else 0
-
-    # If link is image-type but user hasn't activated /images, instruct them
-    if (is_tiktok_photo or is_pinterest) and not image_mode:
-        await m.answer("🖼 Похоже, это ссылка на изображение (TikTok photo или Pinterest). Чтобы скачивать изображения, сперва введите команду /images и затем отправьте ссылку. Если вы хотите скачать видео — пришлите ссылку на видео.")
-        return
-
-    # If image_mode active — handle as image (and then reset image_mode to 0)
-    if image_mode:
-        await set_image_mode(user_id, 0)  # one-shot mode
-        # Process in executor: safe_download_video handles image pages and videos.
-        await download_queue.put((m.chat.id, user_id, url))
-        await m.answer("📥 Добавлено в очередь на скачивание изображения/видео... (режим изображений).")
-        return
-
-    # Normal video flow
-    if not await can_download(user_id):
-        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
-        return
-    await download_queue.put((m.chat.id, user_id, url))
-    await m.answer("📥 Добавлено в очередь...")
-
-# -------------------- Админ и покупка (старые команды) --------------------
-@dp.message(Command("buy_gold"))
-async def buy_gold_invoice(m: Message):
-    prices = [LabeledPrice(label=f"Золотой ({GOLD_DAYS} дней)", amount=GOLD_PRICE)]
-    # provider_token пустой — если у вас есть провайдер, заполните
-    try:
-        await bot.send_invoice(m.chat.id, title="Золотой премиум", description="Покупка премиума",
-                               payload=f"gold:{m.from_user.id}", provider_token="", currency="XTR", prices=prices,
-                               start_parameter="premium")
-    except Exception:
-        await m.answer("⚠️ Оплата через invoice не настроена на этом сервере. Используйте /buy_gold_stars или /buy_gold_points.")
-
-@dp.message(Command("buy_diamond"))
-async def buy_diamond_invoice(m: Message):
-    prices = [LabeledPrice(label=f"Алмазный ({DIAMOND_DAYS} дней)", amount=DIAMOND_PRICE)]
-    try:
-        await bot.send_invoice(m.chat.id, title="Алмазный премиум", description="Покупка премиума",
-                               payload=f"diamond:{m.from_user.id}", provider_token="", currency="XTR", prices=prices,
-                               start_parameter="premium")
-    except Exception:
-        await m.answer("⚠️ Оплата через invoice не настроена на этом сервере. Используйте /buy_diamond_stars или /buy_diamond_points.")
-
-@dp.pre_checkout_query()
-async def pre_checkout(q: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(q.id, ok=True)
-
-@dp.message(Command("profile"))
-async def profile_handler(m: Message):
-    user = await get_user(m.from_user.id)
-    if not user:
-        await m.answer("👤 Профиль: не найден")
-        return
-    await m.answer(
-        f"👤 Профиль\n"
-        f"💎 {user[1]}\n"
-        f"⭐ Звёзды: {user[2]}\n"
-        f"🔹 Очки: {user[3]}\n"
-    )
-
-# -------------------- Админ команды --------------------
-@dp.message(Command("admin"))
-async def admin_handler(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    await m.answer(
-        "🛠 Админ панель:\n"
-        "/stats — Статистика и топ\n"
-        "/give_gold ID — Выдать Золотой\n"
-        "/give_diamond ID — Выдать Алмазный\n"
-        "/add_stars ID сумма — Начислить звёзды\n/give_points ID сумма — Выдать очки"
-    )
 
 @dp.message(F.text.startswith("/give_gold"))
 async def give_gold(m: Message):
