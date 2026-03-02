@@ -1,4 +1,4 @@
-# main.py — полностью исправленная версия для Railway
+# main.py — финальная версия для Railway
 import os
 import re
 import uuid
@@ -57,13 +57,16 @@ USE_COOKIES = os.path.exists(COOKIES_FILE)
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".m4v")
 AUDIO_EXTS = (".mp3", ".m4a", ".webm", ".aac", ".opus")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
-MIN_VIDEO_BYTES = 20_000  # минимальный размер принимаемого видео (байты) - для безопасности
+MIN_VIDEO_BYTES = 20_000  # минимальный размер принимаемого видео (байты)
 
 # Инициализация бота и диспетчера
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 audio_cache: Dict[str, Dict[str, Optional[Any]]] = {}
 BOT_USERNAME: Optional[str] = None
+
+# Очередь загрузок будет создана в on_startup
+download_queue: asyncio.Queue = None
 
 # ---------------- ffmpeg / ffprobe ----------------
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
@@ -238,21 +241,21 @@ def download_file_sync(url: str, dest_path: str, timeout: int = 30) -> bool:
 def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None) -> str:
     """
     Пытается скачать видео, перебирая различные форматы.
-    Сначала bestvideo+bestaudio, затем best, затем форматы с ограничением по высоте.
+    Добавлены параметры для YouTube: несколько клиентов, гео-обход.
     """
     # Список форматов для последовательных попыток
     format_tries = [
-        "bestvideo+bestaudio/best",  # стандартный
-        "best",                       # лучший единый файл
-        "best[height<=720]",          # 720p
-        "best[height<=480]",          # 480p
-        "worst",                       # худший (на случай, если только он доступен)
+        "bestvideo+bestaudio/best",
+        "best",
+        "best[height<=720]",
+        "best[height<=480]",
+        "worst",
     ]
     
     def _run_with_opts(opts):
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Пытаемся получить имя файла из информации
+            # Попытка получить имя файла
             if 'requested_downloads' in info and info['requested_downloads']:
                 filename = info['requested_downloads'][0].get('filepath')
                 if filename and os.path.exists(filename):
@@ -275,20 +278,20 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
     # Базовые опции
     base_opts = {
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
-        "quiet": True, 
-        "no_warnings": True, 
+        "quiet": True,
+        "no_warnings": True,
         "ignoreerrors": False,
-        "noplaylist": True, 
+        "noplaylist": True,
         "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        "allow_unplayable_formats": True, 
-        "merge_output_format": "mp4", 
+        "allow_unplayable_formats": True,
+        "merge_output_format": "mp4",
         "no_color": True,
         "geo_bypass": True,
     }
     
-    # Для YouTube добавляем специальные аргументы
+    # Для YouTube добавляем несколько клиентов
     if "youtube.com" in url or "youtu.be" in url:
-        base_opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        base_opts["extractor_args"] = {"youtube": {"player_client": ["android", "web", "ios"]}}
     
     if cookiefile and os.path.exists(cookiefile):
         base_opts["cookiefile"] = cookiefile
@@ -309,11 +312,11 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
     raise last_error or Exception("Все форматы недоступны")
 
 def safe_download_video(url: str, folder: str) -> None:
-    """Основная функция скачивания: сначала yt-dlp с перебором форматов, если не сработает — скрапинг."""
+    """Основная функция скачивания: сначала yt-dlp, затем скрапинг."""
     logger.info("safe_download_video: %s", url)
     url = resolve_redirect(url)
     
-    # Пытаемся через yt-dlp с перебором форматов
+    # Пытаемся через yt-dlp
     try:
         filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
         logger.info("yt-dlp успешно сохранил %s", filename)
@@ -337,7 +340,7 @@ def safe_download_video(url: str, folder: str) -> None:
     except Exception as e:
         logger.debug("скрапинг видео не удался: %s", e)
 
-    # Последний шанс: сохранить картинки
+    # Последний шанс: картинки
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         html = r.text
@@ -355,6 +358,9 @@ def safe_download_video(url: str, folder: str) -> None:
 
 # -------------------- ffprobe helpers --------------------
 async def has_video_stream(path: str) -> bool:
+    # Сначала проверяем размер – файл не должен быть нулевым
+    if os.path.getsize(path) == 0:
+        return False
     if not HAS_FFPROBE:
         lower = path.lower()
         return any(lower.endswith(ext) for ext in (".mp4", ".mkv", ".mov", ".ts", ".webm"))
@@ -370,6 +376,8 @@ async def has_video_stream(path: str) -> bool:
         return False
 
 async def has_audio_stream(path: str) -> bool:
+    if os.path.getsize(path) == 0:
+        return False
     if not HAS_FFPROBE:
         lower = path.lower()
         return any(lower.endswith(ext) for ext in AUDIO_EXTS + (".mp4", ".webm"))
@@ -386,9 +394,7 @@ async def has_audio_stream(path: str) -> bool:
 
 # -------------------- merge helper --------------------
 async def merge_video_and_audio(video_path: str, audio_path: str, output_path: str) -> bool:
-    """Объединяет видео и аудио в один файл."""
     if not HAS_FFMPEG:
-        logger.info("ffmpeg недоступен: невозможно объединить")
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -440,9 +446,7 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
 
 # -------------------- Find audio-only candidate --------------------
 async def find_audio_candidate(folder: str, video_path: str) -> Optional[str]:
-    """Ищет отдельный аудиофайл в папке."""
     files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
-    # Сначала ищем файлы с аудио без видео
     audio_candidates = []
     for f in files:
         if os.path.abspath(f) == os.path.abspath(video_path):
@@ -457,7 +461,6 @@ async def find_audio_candidate(folder: str, video_path: str) -> Optional[str]:
     if audio_candidates:
         audio_candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
         return audio_candidates[0]
-    # По расширению
     for f in files:
         if f.lower().endswith(AUDIO_EXTS):
             return f
@@ -466,8 +469,6 @@ async def find_audio_candidate(folder: str, video_path: str) -> Optional[str]:
 # -------------------- Download worker --------------------
 async def download_worker():
     logger.info("Download worker started")
-    # Очередь должна быть создана до запуска воркера, но мы создадим её в on_startup и передадим через замыкание
-    # Используем глобальную переменную, но она будет инициализирована в on_startup
     global download_queue
     while True:
         chat_id, user_id, url = await download_queue.get()
@@ -478,11 +479,11 @@ async def download_worker():
             # Скачивание
             await asyncio.get_event_loop().run_in_executor(None, partial(safe_download_video, url, tmp))
 
-            # Собираем файлы
+            # Собираем файлы, игнорируем нулевые
             candidates = []
             for f in os.listdir(tmp):
                 full = os.path.join(tmp, f)
-                if os.path.isfile(full):
+                if os.path.isfile(full) and os.path.getsize(full) > 0:
                     candidates.append(full)
             
             if not candidates:
@@ -519,17 +520,15 @@ async def download_worker():
                         chosen_video = merged_path
                         logger.info("успешно слили аудио и видео")
 
-            # Финальная проверка
-            if not chosen_video or not os.path.exists(chosen_video):
-                await bot.send_message(chat_id, "❌ Не удалось получить рабочее видео.")
-                shutil.rmtree(tmp, ignore_errors=True)
-                continue
-
+            # Проверяем размер
             size = os.path.getsize(chosen_video)
             if size < MIN_VIDEO_BYTES:
-                await bot.send_message(chat_id, "❌ Видео слишком маленькое.")
-                shutil.rmtree(tmp, ignore_errors=True)
-                continue
+                # Если видео слишком маленькое, но мы дошли до сюда – возможно, это ошибка. Отправляем как есть или сообщаем?
+                # По просьбе пользователя убираем это сообщение – просто отправим видео, даже если маленькое.
+                # Оставим предупреждение в логах, но отправим.
+                logger.warning(f"Видео имеет маленький размер: {size} байт, но отправляем.")
+                # Можно не отправлять, но пользователь просит всегда отправлять. Поэтому пропускаем проверку.
+                pass
 
             # Заголовок
             title = None
@@ -682,7 +681,8 @@ async def cmd_start(m: Message):
         "Команды:\n"
         "/premium — Инфо о премиуме\n"
         "/profile — Профиль\n"
-        "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n\n"
+        "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n"
+        "/list_admin — Админ-панель (только для админа)\n\n"
     )
     await m.answer(txt)
 
@@ -759,46 +759,9 @@ async def farm_points(m: Message):
     await set_last_farm(uid, now.isoformat())
     await m.answer(f"🎉 Получено {amount} очков!")
 
-# -------------------- Обработка ссылок --------------------
-@dp.message()
-async def general_message_handler(m: Message):
-    text = m.text or m.caption or ""
-    if not text:
-        return
-    link = extract_first_link_from_text(text)
-    if not link:
-        return
-
-    chat_type = m.chat.type
-
-    # Проверка лимита
-    if not await can_download(m.from_user.id):
-        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
-        return
-
-    if chat_type == "private":
-        await download_queue.put((m.chat.id, m.from_user.id, link))
-        await m.answer("📥 Добавлено в очередь...")
-        return
-
-    if chat_type in ("group", "supergroup"):
-        token = uuid.uuid4().hex
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Извлечь видео", callback_data=f"group_dl:{token}")]
-        ])
-        audio_cache[token] = {
-            "url": link,
-            "owner": m.from_user.id,
-            "chat_id": m.chat.id,
-        }
-        await m.reply(
-            f"ℹ️ {m.from_user.first_name}, чтобы скачать видео, нажмите кнопку ниже.",
-            reply_markup=kb
-        )
-
-# -------------------- Админ --------------------
-@dp.message(Command("admin"))
-async def admin_handler(m: Message):
+# -------------------- Админ-команда /list_admin --------------------
+@dp.message(Command("list_admin"))
+async def list_admin_handler(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     await m.answer(
@@ -863,6 +826,43 @@ async def give_points_handler(m: Message):
     except Exception:
         await m.answer("❌ Неверный формат. /give_points ID сумма")
 
+# -------------------- Обработка ссылок --------------------
+@dp.message()
+async def general_message_handler(m: Message):
+    text = m.text or m.caption or ""
+    if not text:
+        return
+    link = extract_first_link_from_text(text)
+    if not link:
+        return
+
+    chat_type = m.chat.type
+
+    # Проверка лимита
+    if not await can_download(m.from_user.id):
+        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
+        return
+
+    if chat_type == "private":
+        await download_queue.put((m.chat.id, m.from_user.id, link))
+        await m.answer("📥 Добавлено в очередь...")
+        return
+
+    if chat_type in ("group", "supergroup"):
+        token = uuid.uuid4().hex
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Извлечь видео", callback_data=f"group_dl:{token}")]
+        ])
+        audio_cache[token] = {
+            "url": link,
+            "owner": m.from_user.id,
+            "chat_id": m.chat.id,
+        }
+        await m.reply(
+            f"ℹ️ {m.from_user.first_name}, чтобы скачать видео, нажмите кнопку ниже.",
+            reply_markup=kb
+        )
+
 # -------------------- Startup и Shutdown --------------------
 async def on_startup():
     global download_queue
@@ -876,7 +876,7 @@ async def on_startup():
     download_queue = asyncio.Queue()
     asyncio.create_task(download_worker())
     
-    # Если используется вебхук, установим его
+    # Устанавливаем вебхук, если есть RAILWAY_STATIC_URL
     if os.getenv('RAILWAY_STATIC_URL'):
         webhook_url = f"https://{os.getenv('RAILWAY_STATIC_URL')}/webhook"
         await bot.set_webhook(webhook_url, drop_pending_updates=True)
@@ -886,13 +886,11 @@ async def on_shutdown():
     await bot.delete_webhook()
     logger.info("Webhook removed")
 
-# Регистрируем startup/shutdown
 dp.startup.register(on_startup)
 dp.shutdown.register(on_shutdown)
 
 # -------------------- Запуск --------------------
 def main():
-    # Если нет RAILWAY_STATIC_URL (локально), используем polling
     if not os.getenv('RAILWAY_STATIC_URL'):
         logger.info("RAILWAY_STATIC_URL not set, starting polling...")
         try:
@@ -901,7 +899,6 @@ def main():
             logger.info("Bot stopped")
         return
 
-    # Иначе запускаем веб-сервер с вебхуками
     app = web.Application()
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
