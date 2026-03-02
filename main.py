@@ -781,10 +781,8 @@ async def cmd_start(m: Message):
         "После отправки видео появится кнопка «Получить песню 🎵» — нажмите, чтобы получить MP3.\n\n"
         "Команды:\n"
         "/premium — Информация о премиуме\n"
-        "/profile — Профиль (очки, уровень, скачиваний осталось)\n"
+        "/profile — Профиль\n"
         "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n\n"
-        f"ffmpeg: {HAS_FFMPEG}, ffprobe: {HAS_FFPROBE}\n"
-        "Если ffmpeg не установлен на хостинге — установите его (на Railway: добавьте `apt-get install -y ffmpeg` в Build Command)."
     )
     await m.answer(txt)
 
