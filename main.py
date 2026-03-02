@@ -764,12 +764,9 @@ async def cmd_start(m: Message):
         "Я скачиваю видео по ссылкам (YouTube / Shorts, TikTok, Pinterest и др.) и отправляю их вам.\n"
         "После отправки видео появится кнопка «Получить песню 🎵» — нажмите, чтобы получить MP3.\n\n"
         "Команды:\n"
-        "/convert <link> — скачать видео (в группе используйте /convert <link> или упомяните бота рядом с ссылкой)\n"
-        "/premium — Информация о премиуме и кнопки покупки (за очки)\n"
+        "/premium — Информация о премиуме\n"
         "/profile — Профиль (очки, уровень, скачиваний осталось)\n"
         "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n\n"
-        f"ffmpeg: {HAS_FFMPEG}, ffprobe: {HAS_FFPROBE}\n"
-        "Если ffmpeg не установлен на хостинге — установите его (на Railway: добавьте `apt-get install -y ffmpeg` в Build Command)."
     )
     await m.answer(txt)
 
@@ -794,7 +791,6 @@ async def premium_handler(m: Message):
         f"💎 Уровень премиума: {premium}\n"
         f"⏳ Действует до: {expires}\n"
         f"🔹 Очки: {points}\n"
-        f"📦 Всего премиум-пользователей (gold/diamond): {total_premium}\n\n"
         "Что дают уровни:\n"
         "• Золотой — лимит загрузок 10 в день (вместо 4), приоритет очереди, срок: "
         f"{GOLD_DAYS} дней (стоимость {GOLD_PRICE} очков).\n"
