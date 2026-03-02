@@ -1,9 +1,7 @@
-# main.py — полностью рабочая версия (замените TOKEN)
-# Требования: aiogram, aiosqlite, yt-dlp, requests
-# Положите cookies.txt рядом с файлом, если хотите использовать авторизацию YouTube/Pinterest.
+# main.py — упрощённый и надёжный бот: всегда использует "best" (bv*+ba/best)
+# Требования: aiogram, aiosqlite, yt-dlp, requests, ffmpeg (если нужно извлечение/слияние)
 import os
 import re
-import json
 import uuid
 import shutil
 import random
@@ -16,18 +14,20 @@ from functools import partial
 
 import requests
 import aiosqlite
-from yt_dlp import YoutubeDL, utils as ytdlp_utils
+from yt_dlp import YoutubeDL
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-# -------------------- Настройки / лог --------------------
+# -------------------- Лог и конфиг --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Замени TOKEN на свой токен
 TOKEN = os.getenv("TOKEN") or "REPLACE_WITH_YOUR_TOKEN"
-ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)  # ваш ID по умолчанию
+# Ваш телеграм-ID как админа (попросили добавить)
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
 # Премиум / очки / лимиты
@@ -52,12 +52,12 @@ download_queue: asyncio.Queue = asyncio.Queue()
 audio_cache: Dict[str, Dict[str, Optional[Any]]] = {}
 BOT_USERNAME: Optional[str] = None
 
-# ---------------- ffmpeg / ffprobe ----------------
+# ffmpeg / ffprobe наличие
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 HAS_FFPROBE = shutil.which("ffprobe") is not None
-logger.info("ffmpeg available: %s, ffprobe available: %s", HAS_FFMPEG, HAS_FFPROBE)
+logger.info("ffmpeg: %s, ffprobe: %s", HAS_FFMPEG, HAS_FFPROBE)
 
-# -------------------- БД --------------------
+# -------------------- DB --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -166,8 +166,8 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
 # -------------------- Веб-помощники --------------------
 def resolve_redirect(url: str, timeout: int = 10) -> str:
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=timeout, allow_redirects=True)
-        if r.status_code in (200,301,302):
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout, allow_redirects=True)
+        if r.status_code in (200, 301, 302):
             return r.url
     except Exception:
         pass
@@ -181,36 +181,20 @@ def extract_first_link_from_text(text: str) -> Optional[str]:
         return m.group(1).rstrip('.,)')
     return None
 
-def find_media_urls_from_html(html: str) -> List[str]:
-    out = []
-    for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:mp4|webm|m3u8)(?:\?[^"\s<>]*)?', html, flags=re.IGNORECASE):
-        out.append(m.group(0))
-    for key in ('playAddr','downloadAddr','videoUrl','contentUrl','src'):
-        for m in re.finditer(rf'"{key}"\s*:\s*"(https?://[^"]+)"', html, flags=re.IGNORECASE):
-            candidate = m.group(1)
-            if re.search(r'\.(?:mp4|webm|m3u8)(?:\?|$)', candidate, flags=re.IGNORECASE):
-                out.append(candidate)
-    seen = set(); res = []
-    for u in out:
-        uu = u.replace('\\u002F','/').replace('\\/','/').replace('\\','')
-        if uu not in seen:
-            seen.add(uu); res.append(uu)
-    return res
-
 def find_image_urls_from_html(html: str) -> List[str]:
     out = []
     for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp|gif)(?:\?[^"\s<>]*)?', html, flags=re.IGNORECASE):
         out.append(m.group(0))
     seen = set(); res = []
     for u in out:
-        uu = u.replace('\\u002F','/').replace('\\/','/').replace('\\','')
+        uu = u.replace('\\u002F', '/').replace('\\/', '/').replace('\\', '')
         if uu not in seen:
             seen.add(uu); res.append(uu)
     return res
 
 def download_file_sync(url: str, dest_path: str, timeout: int = 30) -> bool:
     try:
-        with requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, stream=True, timeout=timeout) as r:
+        with requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=timeout) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -221,30 +205,36 @@ def download_file_sync(url: str, dest_path: str, timeout: int = 30) -> bool:
         logger.debug("download_file_sync failed %s -> %s", url, e)
         return False
 
-# -------------------- yt-dlp wrapper (robust) --------------------
-def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None, format_expr: Optional[str] = None) -> str:
+# -------------------- yt-dlp wrapper (FORCE SAFE "best") --------------------
+def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None) -> str:
     """
-    Robust wrapper:
-      - primary format: 'bv*+ba/best' (works for separate video/audio or combined)
-      - fallback: 'best'
-      - saves title.txt
-      - returns path to saved file
+    Скачиваем с yt-dlp используя максимально надёжный формат:
+    'bv*+ba/best' — сначала попытаемся объединить best video + best audio, иначе best.
     """
-    if not format_expr:
-        format_expr = "bv*+ba/best"  # universal: try merge of separate streams, else best single file
+    outtmpl = os.path.join(folder, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        # ключевой момент — универсальный формат (не пытаться list/formats заранее)
+        "format": "bv*+ba/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "noplaylist": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "allow_unplayable_formats": True,
+        "no_color": True,
+    }
+    if cookiefile and os.path.exists(cookiefile):
+        ydl_opts["cookiefile"] = cookiefile
 
-    def run_opts(opts):
-        with YoutubeDL(opts) as ydl:
+    # Первый (и основной) проход
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            title = info.get("title") if isinstance(info, dict) else ""
-            try:
-                with open(os.path.join(folder, "title.txt"), "w", encoding="utf-8") as f:
-                    f.write(title or "")
-            except Exception:
-                pass
-            # try prepare filename
             try:
                 filename = ydl.prepare_filename(info)
+                # try mp4 alt
                 if os.path.exists(filename):
                     return filename
                 alt = os.path.splitext(filename)[0] + ".mp4"
@@ -252,77 +242,73 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None,
                     return alt
             except Exception:
                 pass
-            # fallback: return newest file
+            # fallback to newest file in folder
             files = [os.path.join(folder, f) for f in os.listdir(folder)]
             files = [f for f in files if os.path.isfile(f)]
-            if not files:
-                raise Exception("yt-dlp didn't save any file")
-            return sorted(files, key=os.path.getmtime, reverse=True)[0]
-
-    base_opts = {
-        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
-        "format": format_expr,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "noplaylist": True,
-        "http_headers": {"User-Agent":"Mozilla/5.0"},
-        "allow_unplayable_formats": True,
-        "merge_output_format": "mp4",
-        "no_color": True,
-        # minimize log spam
-    }
-    if cookiefile and os.path.exists(cookiefile):
-        base_opts["cookiefile"] = cookiefile
-
-    try:
-        return run_opts(base_opts)
+            if files:
+                return sorted(files, key=os.path.getmtime, reverse=True)[0]
+            raise Exception("yt-dlp didn't save any file")
     except Exception as e:
-        logger.info("yt-dlp attempt (format=%s) failed: %s — trying fallback 'best'", format_expr, e)
+        logger.info("yt-dlp high level failed: %s", e)
 
-    fallback_opts = base_opts.copy()
+    # Если всё упало, пробуем самый мягкий fallback 'best'
+    fallback_opts = ydl_opts.copy()
     fallback_opts["format"] = "best"
-    if "cookiefile" in base_opts:
-        fallback_opts["cookiefile"] = base_opts["cookiefile"]
-    try:
-        return run_opts(fallback_opts)
-    except Exception as e2:
-        logger.exception("yt-dlp fallback 'best' failed: %s", e2)
-        raise
+    if "cookiefile" in ydl_opts:
+        fallback_opts["cookiefile"] = ydl_opts["cookiefile"]
+    with YoutubeDL(fallback_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        try:
+            filename = ydl.prepare_filename(info)
+            if os.path.exists(filename):
+                return filename
+            alt = os.path.splitext(filename)[0] + ".mp4"
+            if os.path.exists(alt):
+                return alt
+        except Exception:
+            pass
+        files = [os.path.join(folder, f) for f in os.listdir(folder)]
+        files = [f for f in files if os.path.isfile(f)]
+        if files:
+            return sorted(files, key=os.path.getmtime, reverse=True)[0]
+        raise Exception("yt-dlp fallback didn't save any file")
 
 def safe_download_video(url: str, folder: str) -> None:
     """
-    Try to download via yt-dlp (preferred), then scraping direct video URLs, then save images as last resort.
+    Безопасная загрузка:
+    1) пробуем yt-dlp с универсальным форматом "bv*+ba/best"
+    2) если не получилось — пробуем html scrape для прямых mp4/webm
+    3) если и это не помогло — сохраняем картинки (но бот позже сообщит, что не работает с изображениями)
     """
     logger.info("safe_download_video start url=%s", url)
     url = resolve_redirect(url)
-    # try yt-dlp (robust)
+    # Попытка yt-dlp
     try:
         filename = download_with_ytdlp(url, folder, cookiefile=COOKIES_FILE if USE_COOKIES else None)
         logger.info("download_with_ytdlp saved %s", filename)
         return
     except Exception as e:
-        logger.info("yt-dlp high level failed: %s", e)
+        logger.info("yt-dlp failed: %s", e)
 
-    # html scraping for direct video urls
+    # html scraping for direct video urls (mp4/webm/m3u8)
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         html = r.text
-        media_urls = find_media_urls_from_html(html)
-        if media_urls:
-            for m_url in media_urls:
-                ext_m = re.search(r'\.([a-zA-Z0-9]+)(?:\?|$)', m_url)
-                ext = ext_m.group(1) if ext_m else "mp4"
-                dst = os.path.join(folder, "scraped_video." + ext)
-                if download_file_sync(m_url, dst):
-                    logger.info("downloaded scraped media %s", dst)
-                    return
+        # ищем медиа
+        for m in re.finditer(r'https?://[^\s"\'<>]+?\.(?:mp4|webm|m3u8)(?:\?[^"\s<>]*)?', html, flags=re.IGNORECASE):
+            m_url = m.group(0)
+            ext_m = re.search(r'\.([a-zA-Z0-9]+)(?:\?|$)', m_url)
+            ext = ext_m.group(1) if ext_m else "mp4"
+            dst = os.path.join(folder, "scraped_video." + ext)
+            if download_file_sync(m_url, dst):
+                logger.info("downloaded scraped media %s", dst)
+                return
     except Exception as e:
         logger.debug("html media scrape failed: %s", e)
 
     # last resort: save images
     try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         html = r.text
         image_urls = find_image_urls_from_html(html)
         for i, img in enumerate(image_urls[:10], start=1):
@@ -336,70 +322,7 @@ def safe_download_video(url: str, folder: str) -> None:
     except Exception:
         pass
 
-# -------------------- FFprobe helpers --------------------
-async def has_video_stream(path: str) -> bool:
-    if not HAS_FFPROBE:
-        lower = path.lower()
-        return any(lower.endswith(ext) for ext in (".mp4", ".mkv", ".mov", ".ts", ".webm"))
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", "v",
-            "-show_entries", "stream=index", "-of", "csv=p=0", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        out, err = await proc.communicate()
-        return bool(out and out.strip())
-    except Exception:
-        return False
-
-async def has_audio_stream(path: str) -> bool:
-    if not HAS_FFPROBE:
-        lower = path.lower()
-        return any(lower.endswith(ext) for ext in AUDIO_EXTS + (".mp4", ".webm"))
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", "a",
-            "-show_entries", "stream=index", "-of", "csv=p=0", path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        out, err = await proc.communicate()
-        return bool(out and out.strip())
-    except Exception:
-        return False
-
-# -------------------- merge helper --------------------
-async def merge_video_and_audio(video_path: str, audio_path: str, output_path: str) -> bool:
-    if not HAS_FFMPEG:
-        logger.info("ffmpeg not available: cannot merge")
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-i", video_path, "-i", audio_path,
-            "-c", "copy", output_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc.communicate()
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return True
-    except Exception:
-        logger.exception("stream copy merge failed")
-    try:
-        proc2 = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-i", video_path, "-i", audio_path,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "192k",
-            output_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc2.communicate()
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception:
-        logger.exception("transcode merge failed")
-        return False
-
-# -------------------- extract audio via ffmpeg --------------------
+# -------------------- ffmpeg helpers --------------------
 async def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> bool:
     if not HAS_FFMPEG:
         logger.info("ffmpeg not available — cannot extract audio")
@@ -433,7 +356,39 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         logger.exception("cleanup_audio_after_delay failed")
     audio_cache.pop(token, None)
 
-# -------------------- Find audio-only candidate for a video --------------------
+# -------------------- helper: detect video/audio quickly (fallback) --------------------
+async def has_video_stream(path: str) -> bool:
+    # если нет ffprobe — делаем простую проверку по расширению
+    if not HAS_FFPROBE:
+        lower = path.lower()
+        return any(lower.endswith(ext) for ext in (".mp4", ".mkv", ".mov", ".ts", ".webm"))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v",
+            "-show_entries", "stream=index", "-of", "csv=p=0", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        return bool(out and out.strip())
+    except Exception:
+        return False
+
+async def has_audio_stream(path: str) -> bool:
+    if not HAS_FFPROBE:
+        lower = path.lower()
+        return any(lower.endswith(ext) for ext in AUDIO_EXTS + (".mp4", ".webm"))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        return bool(out and out.strip())
+    except Exception:
+        return False
+
+# -------------------- Find audio-only in folder (heuristic) --------------------
 async def find_audio_candidate(folder: str, video_path: str) -> Optional[str]:
     files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
     audio_candidates = []
@@ -468,6 +423,7 @@ async def download_worker():
             await bot.send_message(chat_id, "⏳ Скачиваю...")
             await asyncio.get_event_loop().run_in_executor(None, partial(safe_download_video, url, tmp))
 
+            # collect files
             candidates = []
             for f in os.listdir(tmp):
                 full = os.path.join(tmp, f)
@@ -493,34 +449,46 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # if chosen_video lacks audio -> try to find audio file and merge
+            # Если видео без аудио — ищем отдельный аудиофайл и мержим (если есть ffmpeg)
             if not await has_audio_stream(chosen_video):
                 audio_candidate = await find_audio_candidate(tmp, chosen_video)
                 if audio_candidate and HAS_FFMPEG:
                     merged_path = os.path.join(tmp, "merged_" + uuid.uuid4().hex + ".mp4")
-                    merged_ok = await merge_video_and_audio(chosen_video, audio_candidate, merged_path)
-                    if merged_ok:
-                        chosen_video = merged_path
-                    else:
-                        logger.info("merge failed, try re-download single-file")
-                        try:
-                            shutil.rmtree(tmp, ignore_errors=True)
-                            tmp = tempfile.mkdtemp()
-                            filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None, format_expr="best")
-                            if await has_video_stream(filename):
-                                chosen_video = filename
-                        except Exception:
-                            pass
+                    # пробуем быстрый stream copy (если контейнер позволяет)
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-i", chosen_video, "-i", audio_candidate,
+                            "-c", "copy", merged_path,
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                        )
+                        await proc.communicate()
+                        if os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
+                            chosen_video = merged_path
+                        else:
+                            # fallback transcode
+                            proc2 = await asyncio.create_subprocess_exec(
+                                "ffmpeg", "-y", "-i", chosen_video, "-i", audio_candidate,
+                                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                                "-c:a", "aac", "-b:a", "192k", merged_path,
+                                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                            )
+                            await proc2.communicate()
+                            if os.path.exists(merged_path) and os.path.getsize(merged_path) > 0:
+                                chosen_video = merged_path
+                    except Exception:
+                        logger.exception("merge attempt failed")
                 else:
+                    # пробуем повторный скач — более жёсткий (best)
                     try:
                         shutil.rmtree(tmp, ignore_errors=True)
                         tmp = tempfile.mkdtemp()
-                        filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None, format_expr="best")
+                        filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None)
                         if await has_video_stream(filename):
                             chosen_video = filename
                     except Exception:
                         pass
 
+            # final checks
             if not chosen_video or not os.path.exists(chosen_video):
                 await bot.send_message(chat_id, "❌ Не удалось получить рабочее видео. Попробуйте другую ссылку.")
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -528,34 +496,34 @@ async def download_worker():
 
             size = os.path.getsize(chosen_video)
             if size < MIN_VIDEO_BYTES:
-                await bot.send_message(chat_id, "❌ Полученное видео слишком маленькое или пустое — попробуйте другую ссылку.")
+                await bot.send_message(chat_id, "❌ Полученное видео слишком маленькое — попробуйте другую ссылку.")
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
             # title
-            title = None
+            title = os.path.splitext(os.path.basename(chosen_video))[0]
             title_file = os.path.join(tmp, "title.txt")
             if os.path.exists(title_file):
                 try:
                     with open(title_file, "r", encoding="utf-8") as f:
-                        title = f.read().strip()
+                        t = f.read().strip()
+                        if t:
+                            title = t
                 except Exception:
-                    title = None
-            if not title:
-                title = os.path.splitext(os.path.basename(chosen_video))[0]
+                    pass
 
-            # send video with audio button
             token = uuid.uuid4().hex
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Получить песню 🎵", callback_data=f"get_audio:{token}")]
             ])
             caption = "✅ Готово!\nНажмите кнопку ниже, чтобы получить аудио из видео."
+
             sent_ok = False
             try:
                 await bot.send_video(chat_id, FSInputFile(chosen_video), caption=caption, reply_markup=kb)
                 sent_ok = True
             except Exception:
-                logger.exception("send_video failed; trying send_document")
+                logger.exception("send_video failed, try document")
                 try:
                     await bot.send_document(chat_id, FSInputFile(chosen_video), caption=caption, reply_markup=kb)
                     sent_ok = True
@@ -568,18 +536,20 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
+            # increment downloads
             try:
                 await increment_download(user_id)
             except Exception:
-                logger.exception("increment_download failed for %s", user_id)
+                logger.exception("increment_download failed")
 
             # pre-extract audio
             audio_path = os.path.join(tmp, "audio.mp3")
             audio_ok = False
-            try:
-                audio_ok = await extract_audio_ffmpeg(chosen_video, audio_path)
-            except Exception:
-                audio_ok = False
+            if HAS_FFMPEG:
+                try:
+                    audio_ok = await extract_audio_ffmpeg(chosen_video, audio_path)
+                except Exception:
+                    audio_ok = False
 
             audio_cache[token] = {
                 "audio": audio_path if audio_ok and os.path.exists(audio_path) else None,
@@ -587,7 +557,7 @@ async def download_worker():
                 "video": chosen_video,
                 "url": url,
                 "owner": user_id,
-                "title": title or "Аудио из видео"
+                "title": title
             }
             asyncio.create_task(cleanup_audio_after_delay(token, AUDIO_TTL_SECONDS))
             continue
@@ -620,8 +590,9 @@ async def cb_get_audio(cq: CallbackQuery):
     tmpdir = info.get("tmpdir")
     video_path = info.get("video")
     url = info.get("url")
-    title = info.get("title") or "Аудио из видео"
+    title = info.get("title") or "Аудио"
 
+    # если уже есть
     if audio_path and os.path.exists(audio_path):
         try:
             await bot.send_chat_action(cq.from_user.id, "upload_audio")
@@ -639,6 +610,7 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
         return
 
+    # извлекаем сейчас
     if video_path and os.path.exists(video_path) and HAS_FFMPEG:
         audio_now = os.path.join(tmpdir, "audio_on_demand.mp3")
         await bot.send_chat_action(cq.from_user.id, "record_audio")
@@ -659,6 +631,7 @@ async def cb_get_audio(cq: CallbackQuery):
                 audio_cache.pop(token, None)
             return
 
+    # последний шанс: повторно скачать и извлечь
     new_tmp = tempfile.mkdtemp()
     try:
         await cq.answer("Попытка повторного скачивания для извлечения аудио...", show_alert=True)
@@ -686,6 +659,7 @@ async def cb_get_audio(cq: CallbackQuery):
                         pass
                 audio_cache.pop(token, None)
                 return
+        # пробуем отправить любой найденный аудиофайл
         for f in os.listdir(new_tmp):
             if f.lower().endswith(AUDIO_EXTS):
                 try:
@@ -705,6 +679,7 @@ async def cb_get_audio(cq: CallbackQuery):
             pass
     audio_cache.pop(token, None)
 
+# -------------------- Групповой callback — кнопка извлечь видео --------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("group_dl:"))
 async def cb_group_dl(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
@@ -712,12 +687,11 @@ async def cb_group_dl(cq: CallbackQuery):
     if not info:
         await cq.answer("⚠️ Ссылка устарела.", show_alert=True)
         return
-
     owner = info.get("owner")
     if cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
         await cq.answer("Только тот, кто нажал кнопку, может скачать видео.", show_alert=True)
         return
-
+    # добавляем в очередь
     url = info.get("url")
     chat_id = info.get("chat_id")
     audio_cache.pop(token, None)
@@ -733,11 +707,11 @@ async def cmd_start(m: Message):
         "Я скачиваю видео по ссылкам (YouTube / Shorts, TikTok, Pinterest и др.) и отправляю их вам.\n"
         "После отправки видео появится кнопка «Получить песню 🎵» — нажмите, чтобы получить MP3.\n\n"
         "Команды:\n"
-        "/premium — Информация о премиуме\n"
+        "/premium — Информация о премиуме и покупка за очки\n"
         "/profile — Профиль (очки, уровень, скачиваний осталось)\n"
         "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n\n"
         f"ffmpeg: {HAS_FFMPEG}, ffprobe: {HAS_FFPROBE}\n"
-        "Если YouTube требует авторизацию, экспортируйте cookies в cookies.txt рядом с ботом."
+        "Если ffmpeg не установлен — установите его на хостинге (например, apt-get install -y ffmpeg)."
     )
     await m.answer(txt)
 
@@ -752,7 +726,7 @@ async def premium_handler(m: Message):
         async with db.execute("SELECT premium, COUNT(*) FROM users GROUP BY premium") as cur:
             rows = await cur.fetchall()
     premium_counts = {r[0]: r[1] for r in rows} if rows else {}
-    total_premium = sum(v for k,v in premium_counts.items() if k in ("золотой","алмазный"))
+    total_premium = sum(v for k, v in premium_counts.items() if k in ("золотой", "алмазный"))
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Купить GOLD ({GOLD_PRICE} очков)", callback_data="buy_gold_points")],
         [InlineKeyboardButton(text=f"Купить DIAMOND ({DIAMOND_PRICE} очков)", callback_data="buy_diamond_points")]
@@ -763,13 +737,13 @@ async def premium_handler(m: Message):
         f"🔹 Очки: {points}\n"
         f"📦 Всего премиум-пользователей (gold/diamond): {total_premium}\n\n"
         "Что дают уровни:\n"
-        f"• Золотой — лимит загрузок {LIMITS['золотой']} в день, приоритет, срок: {GOLD_DAYS} дней (стоимость {GOLD_PRICE} очков).\n"
-        f"• Алмазный — безлимит скачиваний, приоритет, срок: {DIAMOND_DAYS} дней (стоимость {DIAMOND_PRICE} очков).\n\n"
-        "Нажмите кнопку, чтобы купить премиум за очки (если у вас достаточно очков)."
+        f"• Золотой — лимит загрузок {LIMITS['обычный']}→{LIMITS['золотой']} в день, приоритет, срок {GOLD_DAYS} дней (стоимость {GOLD_PRICE} очков).\n"
+        f"• Алмазный — безлимит скачиваний, приоритет, срок {DIAMOND_DAYS} дней (стоимость {DIAMOND_PRICE} очков).\n\n"
+        "Нажмите кнопку, чтобы купить премиум за очки (если достаточно)."
     )
     await m.answer(text, reply_markup=kb)
 
-@dp.callback_query(lambda c: c.data in ("buy_gold_points","buy_diamond_points"))
+@dp.callback_query(lambda c: c.data in ("buy_gold_points", "buy_diamond_points"))
 async def buy_points_cb(cq: CallbackQuery):
     uid = cq.from_user.id
     await add_user(uid)
@@ -820,7 +794,7 @@ async def farm_points(m: Message):
     await set_last_farm(uid, now.isoformat())
     await m.answer(f"🎉 Вы получили {amount} очков! (Можно фармить снова через 20 часов)")
 
-# -------------------- Обработка ссылок в личных и группах --------------------
+# -------------------- Обработка ссылок (личка и группы) --------------------
 @dp.message()
 async def general_message_handler(m: Message):
     text = m.text or m.caption or ""
@@ -832,6 +806,7 @@ async def general_message_handler(m: Message):
 
     chat_type = m.chat.type
 
+    # лимит
     if not await can_download(m.from_user.id):
         await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
         return
@@ -841,22 +816,17 @@ async def general_message_handler(m: Message):
         await m.answer("📥 Добавлено в очередь на скачивание...")
         return
 
+    # группы: показываем кнопку "Извлечь видео"
     if chat_type in ("group", "supergroup"):
         token = uuid.uuid4().hex
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📥 Извлечь видео", callback_data=f"group_dl:{token}")]
         ])
-        audio_cache[token] = {
-            "url": link,
-            "owner": m.from_user.id,
-            "chat_id": m.chat.id,
-        }
-        await m.reply(
-            f"ℹ️ {m.from_user.first_name}, чтобы скачать видео, нажмите кнопку ниже.",
-            reply_markup=kb
-        )
+        audio_cache[token] = {"url": link, "owner": m.from_user.id, "chat_id": m.chat.id}
+        await m.reply(f"ℹ️ {m.from_user.first_name}, чтобы скачать видео, нажмите кнопку ниже.", reply_markup=kb)
+        return
 
-# -------------------- Админ (доступно только вам) --------------------
+# -------------------- Админ --------------------
 @dp.message(Command("admin"))
 async def admin_handler(m: Message):
     if m.from_user.id != ADMIN_ID:
@@ -879,12 +849,12 @@ async def stats_handler_admin(m: Message):
         async with db.execute("SELECT id, points FROM users ORDER BY points DESC LIMIT 10") as cur:
             top = await cur.fetchall()
     premium_counts = {r[0]: r[1] for r in rows} if rows else {}
-    total_premium = sum(v for k,v in premium_counts.items() if k in ("золотой","алмазный"))
+    total_premium = sum(v for k, v in premium_counts.items() if k in ("золотой", "алмазный"))
     text = f"📊 Статистика\nВсего премиум-пользователей (gold/diamond): {total_premium}\n\n🏆 Топ-10 по очкам:\n"
     if not top:
         text += "Пока нет игроков."
     else:
-        for i,row in enumerate(top, start=1):
+        for i, row in enumerate(top, start=1):
             uid, pts = row
             text += f"{i}. {uid} — {pts} очков\n"
     await m.answer(text)
