@@ -1,4 +1,4 @@
-# main.py — полный рабочий бот (обновлённый)
+# main.py — улучшённый бот: надежное скачивание + слияние аудио+видео + извлечение MP3
 import os
 import re
 import json
@@ -20,7 +20,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-# -------------------- Лог и настройки --------------------
+# -------------------- Лог и конфиг --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -28,33 +28,34 @@ TOKEN = os.getenv("TOKEN") or "REPLACE_WITH_YOUR_TOKEN"
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
-# премиум (в очках) и лимиты
+# премиум / очки / лимиты
 GOLD_PRICE = int(os.getenv("GOLD_PRICE") or 120)
 GOLD_DAYS = int(os.getenv("GOLD_DAYS") or 30)
 DIAMOND_PRICE = int(os.getenv("DIAMOND_PRICE") or 250)
 DIAMOND_DAYS = int(os.getenv("DIAMOND_DAYS") or 90)
-LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}
+LIMITS = {"обычный": 4, "золотой": 10, "алмазный": None}  # None = безлимит
 
-# временные параметры
 AUDIO_TTL_SECONDS = int(os.getenv("AUDIO_TTL_SECONDS") or 30 * 60)
 COOKIES_FILE = os.path.join(os.getcwd(), "cookies.txt")
 USE_COOKIES = os.path.exists(COOKIES_FILE)
 
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".m4v")
+AUDIO_EXTS = (".mp3", ".m4a", ".webm", ".aac", ".opus")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff")
-MIN_VIDEO_BYTES = 50_000  # минимальный размер принимаемого видео (байты)
+MIN_VIDEO_BYTES = 20_000  # минимальный размер принимаемого видео (байты) - для безопасности
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
 download_queue: asyncio.Queue = asyncio.Queue()
 audio_cache: Dict[str, Dict[str, Optional[Any]]] = {}
+BOT_USERNAME: Optional[str] = None
 
-# ---------------- Проверка ffmpeg / ffprobe ----------------
+# ---------------- ffmpeg / ffprobe ----------------
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 HAS_FFPROBE = shutil.which("ffprobe") is not None
 logger.info("ffmpeg available: %s, ffprobe available: %s", HAS_FFMPEG, HAS_FFPROBE)
 
-# -------------------- DB helpers --------------------
+# -------------------- DB --------------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -160,7 +161,7 @@ async def get_remaining_downloads(user_id: int) -> Tuple[Optional[int], Optional
     remaining = max(limit - downloads_today, 0)
     return remaining, limit, premium
 
-# -------------------- Web helpers --------------------
+# -------------------- Веб-помощники --------------------
 def resolve_redirect(url: str, timeout: int = 10) -> str:
     try:
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=timeout, allow_redirects=True)
@@ -169,6 +170,14 @@ def resolve_redirect(url: str, timeout: int = 10) -> str:
     except Exception:
         pass
     return url
+
+def extract_first_link_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r'(https?://[^\s\)\]\}\,]+)', text)
+    if m:
+        return m.group(1).rstrip('.,)')
+    return None
 
 def find_media_urls_from_html(html: str) -> List[str]:
     out = []
@@ -210,14 +219,12 @@ def download_file_sync(url: str, dest_path: str, timeout: int = 30) -> bool:
         logger.debug("download_file_sync failed %s -> %s", url, e)
         return False
 
-# -------------------- yt-dlp wrapper (improved) --------------------
+# -------------------- yt-dlp wrapper --------------------
 def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None) -> str:
     """
-    Try to download video:
-      1) bestvideo+bestaudio/best (merge if ffmpeg present)
-      2) fallback: best (single file)
-    Records title.txt
-    Returns path to saved file.
+    Try: bestvideo+bestaudio (merge) -> fallback best (single file).
+    Saves title.txt.
+    Returns saved filename path.
     """
     def _run_with_opts(opts):
         with YoutubeDL(opts) as ydl:
@@ -312,7 +319,7 @@ def safe_download_video(url: str, folder: str) -> None:
     except Exception as e:
         logger.debug("html media scrape failed: %s", e)
 
-    # as last resort save images (caller will reject)
+    # last resort: save images
     try:
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
         html = r.text
@@ -332,7 +339,7 @@ def safe_download_video(url: str, folder: str) -> None:
 async def has_video_stream(path: str) -> bool:
     if not HAS_FFPROBE:
         lower = path.lower()
-        return any(lower.endswith(ext) for ext in (".mp4", ".mkv", ".mov", ".ts"))
+        return any(lower.endswith(ext) for ext in (".mp4", ".mkv", ".mov", ".ts", ".webm"))
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-select_streams", "v",
@@ -347,7 +354,7 @@ async def has_video_stream(path: str) -> bool:
 async def has_audio_stream(path: str) -> bool:
     if not HAS_FFPROBE:
         lower = path.lower()
-        return any(lower.endswith(ext) for ext in (".mp3", ".m4a", ".webm", ".mp4", ".aac"))
+        return any(lower.endswith(ext) for ext in AUDIO_EXTS + (".mp4", ".webm"))
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-select_streams", "a",
@@ -359,10 +366,49 @@ async def has_audio_stream(path: str) -> bool:
     except Exception:
         return False
 
-# -------------------- ffmpeg audio extraction --------------------
+# -------------------- merge helper --------------------
+async def merge_video_and_audio(video_path: str, audio_path: str, output_path: str) -> bool:
+    """
+    Try to merge video + audio into output_path.
+    Prefer stream copy; if fails, transcode.
+    """
+    if not HAS_FFMPEG:
+        logger.info("ffmpeg not available: cannot merge")
+        return False
+    try:
+        # Try stream copy first
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_path, "-i", audio_path,
+            "-c", "copy", output_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.communicate()
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
+    except Exception:
+        logger.exception("stream copy merge failed")
+
+    # fallback: transcode to mp4/aac
+    try:
+        proc2 = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_path, "-i", audio_path,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc2.communicate()
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception:
+        logger.exception("transcode merge failed")
+        return False
+
+# -------------------- extract audio via ffmpeg --------------------
 async def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> bool:
     if not HAS_FFMPEG:
-        logger.info("ffmpeg not available — cannot extract audio with ffmpeg")
+        logger.info("ffmpeg not available — cannot extract audio")
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -373,8 +419,8 @@ async def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> bool:
         )
         await proc.communicate()
         return os.path.exists(output_audio_path)
-    except Exception as e:
-        logger.exception("extract_audio_ffmpeg error: %s", e)
+    except Exception:
+        logger.exception("extract_audio_ffmpeg error")
         return False
 
 async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
@@ -393,6 +439,40 @@ async def cleanup_audio_after_delay(token: str, delay: int = AUDIO_TTL_SECONDS):
         logger.exception("cleanup_audio_after_delay failed")
     audio_cache.pop(token, None)
 
+# -------------------- Find audio-only candidate for a video --------------------
+async def find_audio_candidate(folder: str, video_path: str) -> Optional[str]:
+    """
+    Find audio-only file in folder that likely matches video (by extension/size).
+    Use ffprobe to detect audio-only files; otherwise heuristics by extension.
+    """
+    files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+    # prefer files that have audio and no video
+    audio_candidates = []
+    for f in files:
+        # skip the video file itself
+        if os.path.abspath(f) == os.path.abspath(video_path):
+            continue
+        try:
+            a = await has_audio_stream(f)
+            v = await has_video_stream(f)
+            if a and not v:
+                audio_candidates.append(f)
+        except Exception:
+            pass
+    if audio_candidates:
+        # prefer largest audio candidate
+        audio_candidates = sorted(audio_candidates, key=lambda p: os.path.getsize(p), reverse=True)
+        return audio_candidates[0]
+    # fallback heuristics: extension based
+    for f in files:
+        if f.lower().endswith(AUDIO_EXTS):
+            return f
+    # sometimes yt-dlp saves .f251.webm as audio - accept small webm files
+    for f in files:
+        if f.lower().endswith(".webm") and os.path.getsize(f) < 2_000_000:
+            return f
+    return None
+
 # -------------------- Download worker --------------------
 async def download_worker():
     while True:
@@ -401,9 +481,10 @@ async def download_worker():
         token = None
         try:
             await bot.send_message(chat_id, "⏳ Скачиваю...")
+            # download (yt-dlp or scraping)
             await asyncio.get_event_loop().run_in_executor(None, partial(safe_download_video, url, tmp))
 
-            # collect files sorted by size descending
+            # collect files
             candidates = []
             for f in os.listdir(tmp):
                 full = os.path.join(tmp, f)
@@ -411,17 +492,16 @@ async def download_worker():
                     candidates.append(full)
             candidates_sorted = sorted(candidates, key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0, reverse=True)
 
-            # find first file with video stream
+            # choose a video file (first with video stream)
             chosen_video = None
             for p in candidates_sorted:
                 if await has_video_stream(p):
                     chosen_video = p
                     break
 
-            # gather images (if any)
-            image_paths = [p for p in candidates_sorted if p.lower().endswith(IMAGE_EXTS)]
-
-            if image_paths and not chosen_video:
+            # check for images-only
+            images = [p for p in candidates_sorted if p.lower().endswith(IMAGE_EXTS)]
+            if images and not chosen_video:
                 await bot.send_message(chat_id, "❌ Я не работаю с изображениями. Пожалуйста, пришлите ссылку на видео.")
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
@@ -431,25 +511,50 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            size = os.path.getsize(chosen_video) if os.path.exists(chosen_video) else 0
-            if size < MIN_VIDEO_BYTES:
-                # try strict ytdlp re-download
-                try:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    tmp = tempfile.mkdtemp()
-                    filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None)
-                    if await has_video_stream(filename):
-                        chosen_video = filename
-                        size = os.path.getsize(chosen_video)
-                except Exception:
-                    pass
+            # if chosen_video lacks audio -> try to find audio file and merge
+            if not await has_audio_stream(chosen_video):
+                audio_candidate = await find_audio_candidate(tmp, chosen_video)
+                if audio_candidate and HAS_FFMPEG:
+                    merged_path = os.path.join(tmp, "merged_" + uuid.uuid4().hex + ".mp4")
+                    merged_ok = await merge_video_and_audio(chosen_video, audio_candidate, merged_path)
+                    if merged_ok:
+                        # replace chosen_video
+                        chosen_video = merged_path
+                    else:
+                        logger.info("merge failed, will try fallback re-download")
+                        # fallback: re-download single-file best
+                        try:
+                            shutil.rmtree(tmp, ignore_errors=True)
+                            tmp = tempfile.mkdtemp()
+                            filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None)
+                            if await has_video_stream(filename):
+                                chosen_video = filename
+                        except Exception:
+                            pass
+                else:
+                    # no audio candidate OR no ffmpeg -> try fallback re-download with best format
+                    try:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                        tmp = tempfile.mkdtemp()
+                        filename = download_with_ytdlp(url, tmp, cookiefile=COOKIES_FILE if USE_COOKIES else None)
+                        if await has_video_stream(filename):
+                            chosen_video = filename
+                    except Exception:
+                        pass
 
-            if size < MIN_VIDEO_BYTES:
-                await bot.send_message(chat_id, "❌ Скачанное видео слишком маленькое или не содержит контента — попробуйте другую ссылку.")
+            # final checks
+            if not chosen_video or not os.path.exists(chosen_video):
+                await bot.send_message(chat_id, "❌ Не удалось получить рабочее видео. Попробуйте другую ссылку.")
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
-            # read title.txt if present
+            size = os.path.getsize(chosen_video)
+            if size < MIN_VIDEO_BYTES:
+                await bot.send_message(chat_id, "❌ Полученное видео слишком маленькое или пустое — попробуйте другую ссылку.")
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+
+            # read title if available
             title = None
             title_file = os.path.join(tmp, "title.txt")
             if os.path.exists(title_file):
@@ -485,12 +590,13 @@ async def download_worker():
                 shutil.rmtree(tmp, ignore_errors=True)
                 continue
 
+            # increment downloads
             try:
                 await increment_download(user_id)
             except Exception:
                 logger.exception("increment_download failed for %s", user_id)
 
-            # try to pre-extract audio (best-effort)
+            # try pre-extract audio to speed up button click
             audio_path = os.path.join(tmp, "audio.mp3")
             audio_ok = False
             try:
@@ -498,7 +604,6 @@ async def download_worker():
             except Exception:
                 audio_ok = False
 
-            # store in cache
             audio_cache[token] = {
                 "audio": audio_path if audio_ok and os.path.exists(audio_path) else None,
                 "tmpdir": tmp,
@@ -519,7 +624,7 @@ async def download_worker():
             shutil.rmtree(tmp, ignore_errors=True)
             continue
 
-# -------------------- Callback: получение аудио --------------------
+# -------------------- Callback: получить аудио --------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("get_audio:"))
 async def cb_get_audio(cq: CallbackQuery):
     token = cq.data.split(":", 1)[1]
@@ -540,7 +645,7 @@ async def cb_get_audio(cq: CallbackQuery):
     url = info.get("url")
     title = info.get("title") or "Аудио из видео"
 
-    # if we already have audio file
+    # if already extracted
     if audio_path and os.path.exists(audio_path):
         try:
             await bot.send_chat_action(cq.from_user.id, "upload_audio")
@@ -558,7 +663,7 @@ async def cb_get_audio(cq: CallbackQuery):
             audio_cache.pop(token, None)
         return
 
-    # attempt to extract now from saved video
+    # try to extract now
     if video_path and os.path.exists(video_path) and HAS_FFMPEG:
         audio_now = os.path.join(tmpdir, "audio_on_demand.mp3")
         await bot.send_chat_action(cq.from_user.id, "record_audio")
@@ -579,7 +684,7 @@ async def cb_get_audio(cq: CallbackQuery):
                 audio_cache.pop(token, None)
             return
 
-    # if can't extract here, try re-download and extract
+    # final attempt: re-download and extract
     new_tmp = tempfile.mkdtemp()
     try:
         await cq.answer("Попытка повторного скачивания для извлечения аудио...", show_alert=True)
@@ -607,10 +712,9 @@ async def cb_get_audio(cq: CallbackQuery):
                         pass
                 audio_cache.pop(token, None)
                 return
-        # if couldn't get video but obtained audio-only file(s), try to find an audio file
-        # send audio-only if present (best-effort)
+        # try send any audio-only file found
         for f in os.listdir(new_tmp):
-            if f.lower().endswith((".mp3", ".m4a", ".webm", ".aac")):
+            if f.lower().endswith(AUDIO_EXTS):
                 try:
                     await bot.send_audio(cq.from_user.id, FSInputFile(os.path.join(new_tmp, f)), title=title)
                     audio_cache.pop(token, None)
@@ -628,7 +732,7 @@ async def cb_get_audio(cq: CallbackQuery):
             pass
     audio_cache.pop(token, None)
 
-# -------------------- Commands: /start, /premium, /profile, /farm --------------------
+# -------------------- Команды: /start, /convert, /premium, /profile, /farm --------------------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await add_user(m.from_user.id)
@@ -637,12 +741,35 @@ async def cmd_start(m: Message):
         "Я скачиваю видео по ссылкам (YouTube / Shorts, TikTok, Pinterest и др.) и отправляю их вам.\n"
         "После отправки видео появится кнопка «Получить песню 🎵» — нажмите, чтобы получить MP3.\n\n"
         "Команды:\n"
+        "/convert <link> — скачать видео (в группе используйте /convert <link> или упомяните бота рядом с ссылкой)\n"
         "/premium — Информация о премиуме и кнопки покупки (за очки)\n"
         "/profile — Профиль (очки, уровень, скачиваний осталось)\n"
         "/farm — Фарм очков (раз в 20 часов, 10–35 очков)\n\n"
-        "Просто пришлите ссылку на видео — бот сам скачает и пришлёт файл.\n\n"
+        f"ffmpeg: {HAS_FFMPEG}, ffprobe: {HAS_FFPROBE}\n"
+        "Если ffmpeg не установлен на хостинге — установите его (на Railway: добавьте `apt-get install -y ffmpeg` в Build Command)."
     )
     await m.answer(txt)
+
+@dp.message(Command("convert"))
+async def cmd_convert(m: Message):
+    await add_user(m.from_user.id)
+    text = m.text or ""
+    parts = text.split(maxsplit=1)
+    link = None
+    if len(parts) >= 2:
+        link = extract_first_link_from_text(parts[1])
+    if not link:
+        if m.chat.type == "private":
+            await m.answer("🔗 Пришлите ссылку на видео и я скачаю его.")
+            return
+        else:
+            await m.answer("❗ В группе используйте: /convert <ссылка> или упомяните бота рядом с ссылкой.")
+            return
+    if not await can_download(m.from_user.id):
+        await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
+        return
+    await download_queue.put((m.chat.id, m.from_user.id, link))
+    await m.answer("📥 Добавлено в очередь на скачивание...")
 
 @dp.message(Command("premium"))
 async def premium_handler(m: Message):
@@ -697,10 +824,7 @@ async def profile_handler(m: Message):
         await m.answer("👤 Профиль: не найден")
         return
     remaining, limit, premium = await get_remaining_downloads(m.from_user.id)
-    if remaining is None:
-        downloads_text = "♾ Безлимит"
-    else:
-        downloads_text = f"{remaining}/{limit}"
+    downloads_text = "♾ Безлимит" if remaining is None else f"{remaining}/{limit}"
     points = user[2] or 0
     await m.answer(f"👤 Профиль\n💎 {premium}\n🔹 Очки: {points}\n📥 Скачиваний осталось: {downloads_text}")
 
@@ -728,43 +852,59 @@ async def farm_points(m: Message):
     await set_last_farm(uid, now.isoformat())
     await m.answer(f"🎉 Вы получили {amount} очков! (Можно фармить снова через 20 часов)")
 
-# -------------------- Link handler --------------------
-def looks_like_image_url(url: str) -> bool:
-    lower = url.lower()
-    if any(lower.endswith(ext) for ext in IMAGE_EXTS):
-        return True
-    if "tiktok.com" in lower and "/photo/" in lower:
-        return True
-    return False
-
-@dp.message(F.text.startswith("http"))
-async def link_handler(m: Message):
-    user_id = m.from_user.id
-    url = m.text.strip()
-    await add_user(user_id)
-
-    if looks_like_image_url(url):
-        await m.answer("❌ Я не работаю с изображениями. Пожалуйста, пришлите ссылку на видео.")
+# -------------------- Обработка ссылок в личных и группах --------------------
+@dp.message()
+async def general_message_handler(m: Message):
+    text = m.text or m.caption or ""
+    if not text:
+        return
+    link = extract_first_link_from_text(text)
+    if not link:
         return
 
-    if not await can_download(user_id):
+    chat_type = m.chat.type
+    should_process = False
+
+    if chat_type == "private":
+        should_process = True
+    elif chat_type in ("group", "supergroup"):
+        # reply to bot's message
+        if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == (await bot.get_me()).id:
+            should_process = True
+        # mention bot
+        if not should_process and m.entities:
+            for ent in m.entities:
+                if ent.type == "mention":
+                    mention_text = (m.text or m.caption)[ent.offset: ent.offset + ent.length]
+                    if BOT_USERNAME and mention_text.lower() == f"@{BOT_USERNAME.lower()}":
+                        should_process = True
+                        break
+    else:
+        should_process = False
+
+    if not should_process:
+        if chat_type in ("group", "supergroup"):
+            await m.reply("ℹ️ Чтобы бот обработал ссылку в группе, укажите /convert <link> или упомяните бота рядом с ссылкой.")
+        return
+
+    if not await can_download(m.from_user.id):
         await m.answer("❌ Превышен лимит загрузок для вашего уровня.")
         return
 
-    await download_queue.put((m.chat.id, user_id, url))
+    await download_queue.put((m.chat.id, m.from_user.id, link))
     await m.answer("📥 Добавлено в очередь на скачивание...")
 
-# -------------------- Admin (hidden) --------------------
+# -------------------- Админ (скрыт) --------------------
 @dp.message(Command("admin"))
 async def admin_handler(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     await m.answer(
-        "🛠 Админ панель (только для владельца):\n"
-        "/stats — Статистика\n"
-        "/give_gold ID — Выдать Золотой\n"
-        "/give_diamond ID — Выдать Алмазный\n"
-        "/give_points ID сумма — Выдать очки"
+        "🛠 Админ панель:\n"
+        "/stats — статистика\n"
+        "/give_gold ID — выдать золотой\n"
+        "/give_diamond ID — выдать алмазный\n"
+        "/give_points ID сумма — выдать очки"
     )
 
 @dp.message(F.text.startswith("/stats"))
@@ -821,9 +961,13 @@ async def give_points_handler(m: Message):
     except Exception:
         await m.answer("❌ Неверный формат. /give_points ID сумма")
 
-# -------------------- Запуск --------------------
+# -------------------- Startup --------------------
 async def main():
+    global BOT_USERNAME
     await init_db()
+    me = await bot.get_me()
+    BOT_USERNAME = me.username or None
+    logger.info("Bot username: %s", BOT_USERNAME)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
