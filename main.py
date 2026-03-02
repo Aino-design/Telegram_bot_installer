@@ -851,6 +851,76 @@ async def farm_points(m: Message):
     await set_last_farm(uid, now.isoformat())
     await m.answer(f"🎉 Вы получили {amount} очков! (Можно фармить снова через 20 часов)")
 
+# ===== FIX YOUTUBE DOWNLOAD (ВСТАВИТЬ В САМЫЙ НИЗ ФАЙЛА) =====
+
+import tempfile
+import os
+from yt_dlp import YoutubeDL
+from aiogram import types
+
+YOUTUBE_DOMAINS = ["youtube.com", "youtu.be"]
+
+def is_youtube(url: str) -> bool:
+    return any(d in url.lower() for d in YOUTUBE_DOMAINS)
+
+
+def download_youtube_best(url: str) -> str:
+    """
+    Скачивает YouTube/Shorts в mp4 с аудио.
+    Возвращает путь к файлу.
+    """
+    tmp = tempfile.mkdtemp()
+
+    ydl_opts = {
+        "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+        "format": "bv*+ba/best",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+
+    if not filename.endswith(".mp4"):
+        filename = os.path.splitext(filename)[0] + ".mp4"
+
+    return filename
+
+
+# --- АВТОПЕРЕХВАТ ССЫЛОК ---
+@dp.message()
+async def youtube_fix_handler(message: types.Message):
+    text = message.text or ""
+
+    if not any(x in text.lower() for x in YOUTUBE_DOMAINS):
+        return
+
+    url = text.strip()
+
+    await message.reply("📥 Скачиваю видео...")
+
+    try:
+        path = await asyncio.get_event_loop().run_in_executor(
+            None, download_youtube_best, url
+        )
+
+        await message.answer_video(
+            types.FSInputFile(path),
+            caption="✅ Готово"
+        )
+
+        try:
+            os.remove(path)
+        except:
+            pass
+
+    except Exception as e:
+        await message.reply("❌ Не удалось скачать видео")
+        print("YT ERROR:", e)
+
 # -------------------- Обработка ссылок в личных и группах --------------------
 @dp.message()
 async def general_message_handler(m: Message):
