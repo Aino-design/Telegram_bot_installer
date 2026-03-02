@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Настройки (предпочтительно задавать через env)
 TOKEN = os.getenv("TOKEN") or "REPLACE_WITH_YOUR_TOKEN"   # <- замените токен здесь или через переменные окружения
-ADMIN_ID = int(os.getenv("ADMIN_ID") or 6705555401)       # <- ваш Telegram ID (обязательно установить)
+ADMIN_ID = [6705555401]    # <- ваш Telegram ID (обязательно установить)
 DB_PATH = os.getenv("DB_PATH") or "bot_db.sqlite"
 
 # премиум / очки / лимиты
