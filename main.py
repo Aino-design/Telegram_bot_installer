@@ -1,4 +1,4 @@
-# main.py — финальная версия с поддержкой YouTube через cookies и множественные клиенты
+# main.py — финальная версия с улучшенной поддержкой YouTube
 import os
 import re
 import uuid
@@ -13,7 +13,6 @@ from functools import partial
 
 import requests
 import aiosqlite
-import yt_dlp
 from yt_dlp import YoutubeDL
 
 from aiogram import Bot, Dispatcher, F, types
@@ -238,65 +237,15 @@ def download_file_sync(url: str, dest_path: str, timeout: int = 30) -> bool:
         logger.debug("download_file_sync failed %s -> %s", url, e)
         return False
 
-# -------------------- yt-dlp wrapper с множественными попытками --------------------
+# -------------------- yt-dlp wrapper с упрощённой логикой для YouTube --------------------
 def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None) -> str:
     """
-    Пытается скачать видео, перебирая различные форматы и клиенты для YouTube.
-    Также обновляет yt-dlp перед использованием.
+    Упрощённая стратегия для YouTube: перебираем несколько клиентов и форматов.
+    Для других сайтов используем стандартный подход.
     """
-    # Список комбинаций клиент + формат для YouTube
-    youtube_clients = [
-        "android",
-        "web",
-        "ios",
-        "web_embedded",
-        "android_embedded",
-        "android_vr",
-        "web_safari",
-        "web_creator",
-        "web_music",
-    ]
+    # Определяем, YouTube ли это
+    is_youtube = "youtube.com" in url or "youtu.be" in url
     
-    # Форматы для проб
-    formats = [
-        "bestvideo+bestaudio/best",
-        "best",
-        "bestvideo+bestaudio/best[height<=720]",
-        "best[height<=720]",
-        "bestvideo+bestaudio/best[height<=480]",
-        "best[height<=480]",
-        "worst",
-    ]
-    
-    def _run_with_opts(opts):
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Попытка получить имя файла
-            if 'requested_downloads' in info and info['requested_downloads']:
-                filename = info['requested_downloads'][0].get('filepath')
-                if filename and os.path.exists(filename):
-                    return filename
-            try:
-                filename = ydl.prepare_filename(info)
-                if os.path.exists(filename):
-                    return filename
-                alt = os.path.splitext(filename)[0] + ".mp4"
-                if os.path.exists(alt):
-                    return alt
-            except Exception:
-                pass
-            # Ищем любой файл в папке
-            files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
-            if not files:
-                raise Exception("yt-dlp не сохранил ни одного файла")
-            return sorted(files, key=os.path.getmtime, reverse=True)[0]
-
-    # Попытка обновить yt-dlp (опционально)
-    try:
-        yt_dlp.update.update()
-    except Exception:
-        logger.info("yt-dlp update failed, continuing with current version")
-
     # Базовые опции
     base_opts = {
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
@@ -313,42 +262,82 @@ def download_with_ytdlp(url: str, folder: str, cookiefile: Optional[str] = None)
     
     if cookiefile and os.path.exists(cookiefile):
         base_opts["cookiefile"] = cookiefile
-
-    # Сначала пробуем все комбинации для YouTube, если это YouTube
-    if "youtube.com" in url or "youtu.be" in url:
-        for client in youtube_clients:
-            for fmt in formats:
-                try:
-                    opts = base_opts.copy()
-                    opts["format"] = fmt
-                    opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-                    logger.info(f"Попытка YouTube client={client}, format={fmt}")
-                    return _run_with_opts(opts)
-                except Exception as e:
-                    logger.info(f"YouTube client={client}, format={fmt} не удался: {e}")
-                    continue
-        # Если ни одна комбинация не сработала, пробуем без указания клиента
+    
+    if not is_youtube:
+        # Для не-YouTube просто пробуем best
+        base_opts["format"] = "bestvideo+bestaudio/best"
+        with YoutubeDL(base_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return _get_filename(ydl, info, folder)
+    
+    # Для YouTube перебираем клиентов
+    clients = [
+        "android",      # часто работает
+        "web",          # стандартный
+        "ios",          # мобильный
+        "android_embedded",
+        "web_embedded",
+        "android_vr",
+        "web_safari",
+    ]
+    
+    formats = [
+        "bestvideo+bestaudio/best",
+        "best",
+        "best[height<=720]",
+        "best[height<=480]",
+        "worst",
+    ]
+    
+    last_error = None
+    for client in clients:
+        for fmt in formats:
+            try:
+                opts = base_opts.copy()
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                opts["format"] = fmt
+                logger.info(f"Попытка YouTube client={client}, format={fmt}")
+                with YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    return _get_filename(ydl, info, folder)
+            except Exception as e:
+                last_error = e
+                logger.info(f"YouTube client={client}, format={fmt} не удался: {e}")
+                continue
+    
+    # Если ничего не сработало, пробуем без указания клиента (стандартный)
+    try:
+        opts = base_opts.copy()
+        opts["format"] = "best"
         logger.info("Попытка YouTube без указания клиента")
-        for fmt in formats:
-            try:
-                opts = base_opts.copy()
-                opts["format"] = fmt
-                return _run_with_opts(opts)
-            except Exception as e:
-                logger.info(f"YouTube format={fmt} не удался: {e}")
-                continue
-        raise Exception("Все попытки скачать YouTube видео не удались")
-    else:
-        # Для других сайтов пробуем стандартные форматы
-        for fmt in formats:
-            try:
-                opts = base_opts.copy()
-                opts["format"] = fmt
-                return _run_with_opts(opts)
-            except Exception as e:
-                logger.info(f"Format {fmt} не удался: {e}")
-                continue
-        raise Exception("Не удалось скачать видео")
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return _get_filename(ydl, info, folder)
+    except Exception as e:
+        last_error = e
+    
+    raise last_error or Exception("Не удалось скачать YouTube видео")
+
+def _get_filename(ydl, info, folder):
+    """Вспомогательная функция для получения имени файла после скачивания."""
+    if 'requested_downloads' in info and info['requested_downloads']:
+        filename = info['requested_downloads'][0].get('filepath')
+        if filename and os.path.exists(filename):
+            return filename
+    try:
+        filename = ydl.prepare_filename(info)
+        if os.path.exists(filename):
+            return filename
+        alt = os.path.splitext(filename)[0] + ".mp4"
+        if os.path.exists(alt):
+            return alt
+    except Exception:
+        pass
+    # Ищем любой файл в папке
+    files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+    if not files:
+        raise Exception("yt-dlp не сохранил ни одного файла")
+    return sorted(files, key=os.path.getmtime, reverse=True)[0]
 
 def safe_download_video(url: str, folder: str) -> None:
     """Основная функция скачивания: сначала yt-dlp, затем скрапинг."""
@@ -363,7 +352,7 @@ def safe_download_video(url: str, folder: str) -> None:
     except Exception as e:
         logger.info(f"yt-dlp полностью не удался: {e}")
 
-    # Скрапинг HTML для поиска прямых ссылок на видео (резерв)
+    # Скрапинг HTML для поиска прямых ссылок на видео
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         html = r.text
@@ -397,7 +386,6 @@ def safe_download_video(url: str, folder: str) -> None:
 
 # -------------------- ffprobe helpers --------------------
 async def has_video_stream(path: str) -> bool:
-    # Сначала проверяем размер – файл не должен быть нулевым
     if os.path.getsize(path) == 0:
         return False
     if not HAS_FFPROBE:
@@ -558,6 +546,11 @@ async def download_worker():
                     if merged_ok:
                         chosen_video = merged_path
                         logger.info("успешно слили аудио и видео")
+
+            # Проверяем размер (только предупреждение, не блокируем отправку)
+            size = os.path.getsize(chosen_video)
+            if size < MIN_VIDEO_BYTES:
+                logger.warning(f"Видео имеет маленький размер: {size} байт, но отправляем.")
 
             # Заголовок
             title = None
