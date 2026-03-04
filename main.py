@@ -1,4 +1,4 @@
-# main.py — финальная версия с улучшенной поддержкой YouTube
+# main.py — полная версия с поддержкой нескольких администраторов
 import os
 import re
 import uuid
@@ -37,7 +37,13 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("Токен не найден! Установите переменную окружения TOKEN")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "6705555401", "7476993474"))
+# Администраторы: можно указать несколько ID через запятую в переменной ADMINS
+ADMINS_STR = os.getenv("ADMINS", os.getenv("ADMIN_ID", "6705555401"))
+ADMINS = [int(x.strip()) for x in ADMINS_STR.split(",") if x.strip().isdigit()]
+if not ADMINS:
+    ADMINS = [6705555401, 7476993474]  # значение по умолчанию
+logger.info(f"Admins: {ADMINS}")
+
 DB_PATH = os.getenv("DB_PATH", "data/bot_db.sqlite")
 
 # Создаём директорию для базы данных, если её нет
@@ -619,7 +625,7 @@ async def cb_get_audio(cq: CallbackQuery):
         return
 
     owner = info.get("owner")
-    if owner and cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
+    if owner and cq.from_user.id != owner and cq.from_user.id not in ADMINS:
         await cq.answer("Только автор запроса может получить аудио.", show_alert=True)
         return
 
@@ -681,7 +687,7 @@ async def cb_group_dl(cq: CallbackQuery):
         return
 
     owner = info.get("owner")
-    if cq.from_user.id != owner and cq.from_user.id != ADMIN_ID:
+    if cq.from_user.id != owner and cq.from_user.id not in ADMINS:
         await cq.answer("Только автор может скачать видео.", show_alert=True)
         return
 
@@ -784,7 +790,7 @@ async def farm_points(m: Message):
 # -------------------- Админ-команда /list_admin --------------------
 @dp.message(Command("list_admin"))
 async def list_admin_handler(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         return
     await m.answer(
         "🛠 Админ панель:\n"
@@ -796,7 +802,7 @@ async def list_admin_handler(m: Message):
 
 @dp.message(F.text.startswith("/stats"))
 async def stats_handler_admin(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT premium, COUNT(*) FROM users GROUP BY premium") as cur:
@@ -816,7 +822,7 @@ async def stats_handler_admin(m: Message):
 
 @dp.message(F.text.startswith("/give_gold"))
 async def give_gold(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         return
     try:
         uid = int(m.text.split()[1])
@@ -827,7 +833,7 @@ async def give_gold(m: Message):
 
 @dp.message(F.text.startswith("/give_diamond"))
 async def give_diamond(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         return
     try:
         uid = int(m.text.split()[1])
@@ -838,7 +844,7 @@ async def give_diamond(m: Message):
 
 @dp.message(F.text.startswith("/give_points"))
 async def give_points_handler(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         return
     try:
         parts = m.text.split()
