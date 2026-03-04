@@ -37,7 +37,7 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("Токен не найден! Установите переменную окружения TOKEN")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "6705555401"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "6705555401", "7476993474"))
 DB_PATH = os.getenv("DB_PATH", "data/bot_db.sqlite")
 
 # Создаём директорию для базы данных, если её нет
